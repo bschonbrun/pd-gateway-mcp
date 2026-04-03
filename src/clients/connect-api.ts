@@ -63,4 +63,72 @@ export class PipedreamConnectClient {
       body: JSON.stringify({ external_user_id: externalUserId, configured_props: props }),
     });
   }
+
+  async createConnectToken(externalUserId: string) {
+    return this.request('/tokens', {
+      method: 'POST',
+      body: JSON.stringify({ external_user_id: externalUserId }),
+    });
+  }
+
+  async listAccounts(externalUserId: string) {
+    return this.request(`/accounts?external_user_id=${encodeURIComponent(externalUserId)}`);
+  }
+
+  async listTriggers(app?: string) {
+    const q = app ? `?app=${encodeURIComponent(app)}` : '';
+    return this.request(`/triggers${q}`);
+  }
+
+  async getComponent(componentKey: string) {
+    return this.request(`/components/${encodeURIComponent(componentKey)}`);
+  }
+
+  async configureProp(body: {
+    component_id: string;
+    prop_name: string;
+    external_user_id: string;
+    configured_props?: Record<string, unknown>;
+    query?: string;
+  }) {
+    return this.request('/components/configure', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async deployTrigger(body: {
+    trigger_id: string;
+    external_user_id: string;
+    configured_props: Record<string, unknown>;
+    workflow_id?: string;
+    webhook_url?: string;
+  }) {
+    return this.request('/triggers/deploy', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async listDeployedTriggers(externalUserId?: string) {
+    const q = externalUserId ? `?external_user_id=${encodeURIComponent(externalUserId)}` : '';
+    return this.request(`/deployed-triggers${q}`);
+  }
+
+  async deleteDeployedTrigger(triggerId: string, externalUserId: string) {
+    return this.request(
+      `/deployed-triggers/${encodeURIComponent(triggerId)}?external_user_id=${encodeURIComponent(externalUserId)}`,
+      { method: 'DELETE' },
+    );
+  }
+
+  async updateTriggerWorkflows(triggerId: string, workflowIds: string[], externalUserId: string) {
+    return this.request(
+      `/deployed-triggers/${encodeURIComponent(triggerId)}/workflows`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ workflow_ids: workflowIds, external_user_id: externalUserId }),
+      },
+    );
+  }
 }

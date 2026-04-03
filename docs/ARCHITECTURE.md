@@ -1,107 +1,124 @@
-# Pipedream Gateway MCP — Architecture & Design Decisions
+# Architecture
 
-## Why This Exists
+## Problem
 
-Pipedream's official MCP server exposes all 10,000+ app tools directly, making it unusable for AI platforms with tool-count limits (e.g., Antigravity's 100-tool cap). This gateway wraps Pipedream's REST and Connect APIs behind ~7 curated MCP tools.
+Pipedream's official `@pipedream/mcp` server exposes every app as its own tool set — 10,000+ tools total. Most AI platforms cap at 50-128 tools. This gateway collapses the entire surface into 16.
 
-## Gateway vs. Direct MCP — When to Use What
+## Design
 
-| Factor | Direct MCP | Via pd-gateway |
-|---|---|---|
-| **Tool slots** | 10-20 per app | 0 (shared `pd_run_action`) |
-| **Parameter validation** | Full schema, typed | Generic props object |
-| **Complex queries** | Filters, batch, associations | Limited to pre-built actions |
-| **Latency** | Direct API call | gateway → Pipedream → API |
-| **Auth** | Per-server credentials | Single Pipedream credential |
-
-### Recommended Tiering
-
-| Tier | When | Examples |
-|---|---|---|
-| **Direct MCP** | Heavy daily use, complex queries | HubSpot, Supabase |
-| **Gateway** | Light/occasional, simple CRUD | Glide, Slack, Notion, Perplexity |
-
-### Specific App Decisions
-
-| App | Approach | Rationale |
-|---|---|---|
-| **HubSpot** | Keep direct MCP | Complex filters, batch reads, associations — Pipedream actions can't match |
-| **Supabase** | Keep direct MCP | DDL, migrations, raw SQL — critical for development |
-| **Glide** | Gateway | Simple CRUD (5 actions verified) |
-| **Perplexity** | Gateway | 6 actions via Pipedream > 3 via direct MCP, zero slots |
-| **Notion** | Gateway | Saves 18 tool slots, Pipedream has full CRUD actions |
-| **Slack** | Gateway | One-off messages, not worth dedicated MCP |
-
-## Pipedream Has TWO Separate APIs
-
-### 1. REST API v1 (Workflow Management)
-- **Auth:** API Key as Bearer token
-- **Base URL:** `https://api.pipedream.com/v1/`
-- **Purpose:** List/inspect/trigger workflows, view execution history
-- **Key endpoints:**
-  - `GET /users/me/workflows` — list workflows
-  - `GET /workflows/{id}` — workflow details
-  - `GET /workflows/{id}/event_summaries` — execution history
-  - `POST {webhook_url}` — trigger via HTTP
-
-### 2. Connect API (App Action Execution)
-- **Auth:** OAuth2 client credentials (auto-refresh, expires 1hr)
-- **Base URL:** `https://api.pipedream.com/v1/connect/{project_id}/`
-- **Purpose:** Discover and execute any app action (Glide, Slack, etc.)
-- **Key endpoints:**
-  - `GET /actions?app={slug}` — list actions for an app
-  - `POST /actions/{key}/run` — execute an action
-  - `GET /components?q={query}` — search available apps
-- **Requires header:** `X-PD-Environment: development`
-
-### OAuth Token Flow
 ```
-POST https://api.pipedream.com/v1/oauth/token
-{
-  "grant_type": "client_credentials",
-  "client_id": "...",
-  "client_secret": "..."
-}
-→ { "access_token": "...", "expires_in": 3600 }
-```
-Token expires after 1 hour — gateway must auto-refresh.
-
-## Verified App Actions via Connect API
-
-### Glide (5 actions)
-```
-glide-add-rows      | Add Rows to Table
-glide-get-rows      | Get Rows
-glide-list-tables   | List Big Tables
-glide-update-row    | Update Row
-glide-delete-row    | Delete Row
+┌─────────────────────────┐
+│   MCP Host (AI Agent)   │
+└───────────┬─────────────┘
+            │ stdio (JSON-RPC)
+┌───────────▼─────────────┐
+│    pd-gateway-mcp       │
+│                         │
+│  ┌───────┐ ┌──────────┐ │
+│  │ REST  │ │ Connect  │ │
+│  │ Client│ │ Client   │ │
+│  └───┬───┘ └────┬─────┘ │
+└──────┼──────────┼───────┘
+       │          │
+  Pipedream    Pipedream
+  REST API     Connect API
+  (v1)         (OAuth2)
 ```
 
-### Perplexity (6 actions)
+### Two APIs, One Gateway
+
+| Layer | API | Auth | Purpose |
+|-------|-----|------|---------| 
+| Workflows | REST API v1 | API Key (Bearer) | CRUD workflows, event history, webhook triggers |
+| App Actions | Connect API | OAuth2 client_credentials | App/trigger discovery, action execution, trigger deployment |
+
+## Tool Inventory (16 tools)
+
+The tools follow a **discover → configure → execute → manage** pattern.
+
+### Tier 1: Workflow Management (REST)
+
+| Tool | Verb | Endpoint |
+|------|------|----------|
+| `pd_list_workflows` | GET | `/users/me/workflows` |
+| `pd_get_workflow` | GET | `/workflows/{id}` |
+| `pd_trigger_workflow` | POST | `{webhook_url}` |
+| `pd_get_events` | GET | `/workflows/{id}/event_summaries` |
+
+### Tier 2: App Actions (Connect)
+
+| Tool | Verb | Endpoint |
+|------|------|----------|
+| `pd_list_apps` | GET | `/connect/{project}/components` |
+| `pd_list_app_actions` | GET | `/connect/{project}/actions?app={slug}` |
+| `pd_run_action` | POST | `/connect/{project}/actions/{key}/run` |
+
+### Tier 3: Account Connection (Connect)
+
+| Tool | Verb | Endpoint |
+|------|------|----------|
+| `pd_connect_account` | POST | `/connect/{project}/tokens` |
+| `pd_list_accounts` | GET | `/connect/{project}/accounts` |
+
+### Tier 4: Trigger & Component (Connect)
+
+| Tool | Verb | Endpoint |
+|------|------|----------|
+| `pd_list_triggers` | GET | `/connect/{project}/triggers` |
+| `pd_get_component` | GET | `/connect/{project}/components/{key}` |
+| `pd_configure_prop` | POST | `/connect/{project}/components/configure` |
+| `pd_deploy_trigger` | POST | `/connect/{project}/triggers/deploy` |
+| `pd_list_deployed_triggers` | GET | `/connect/{project}/deployed-triggers` |
+| `pd_delete_deployed_trigger` | DEL | `/connect/{project}/deployed-triggers/{id}` |
+| `pd_update_trigger_workflows` | PUT | `/connect/{project}/deployed-triggers/{id}/workflows` |
+
+## Auth Flow
+
+### REST API
+Direct API key in `Authorization: Bearer {key}` header. No token refresh needed.
+
+### Connect API
+OAuth2 client credentials flow with auto-refresh:
+
+1. POST `/v1/oauth/token` with `client_id` + `client_secret`
+2. Receive `access_token` with `expires_in` (seconds)
+3. Cache token, refresh 60s before expiry
+4. All Connect requests include `X-PD-Environment: development` header
+
+## Environment Variables
+
+| Variable | Required | Used By |
+|----------|----------|---------|
+| `PIPEDREAM_API_KEY` | Yes | REST Client |
+| `PIPEDREAM_CLIENT_ID` | Yes | Connect Client (OAuth) |
+| `PIPEDREAM_CLIENT_SECRET` | Yes | Connect Client (OAuth) |
+| `PIPEDREAM_PROJECT_ID` | Yes | Connect Client (path param) |
+| `PIPEDREAM_EXTERNAL_USER_ID` | No | Connect Client (user identity) |
+
+## Key Workflows
+
+### End-to-end trigger deployment
 ```
-chat-completions           | Basic chat completion
-chat-completions-advanced  | Advanced chat with full params
-create-response            | Create response (newer API)
-search                     | Web search
-create-embeddings          | Text embeddings
-create-contextualized-embeddings | Context-aware embeddings
+pd_list_apps → pd_list_triggers → pd_get_component → pd_configure_prop → pd_deploy_trigger
 ```
 
-## Account Details
+### Smart action execution
+```
+pd_list_app_actions → pd_get_component → pd_configure_prop → pd_run_action
+```
 
-- **Org ID:** `o_g0I1q4k`
-- **Project:** `proj_jBsgrRD` ("Manufacturing Dashboard")
-- **Credentials:** See `.env` file (gitignored)
+### Trigger rewiring
+```
+pd_list_deployed_triggers → pd_update_trigger_workflows
+```
 
-## Tool Surface (7 tools)
+## File Structure
 
-### Workflow Management (REST API)
-1. `pd_list_workflows` — List all workflows
-2. `pd_get_workflow` — Get workflow details
-3. `pd_trigger_workflow` — Trigger via webhook
-4. `pd_get_events` — Execution history
-
-### App Actions (Connect API)
-5. `pd_list_apps` — Search available apps
-6. `pd_list_app_actions` — List actions for an app
-7. `pd_run_action` — Execute any action (the "1 tool = 10k actions" gateway)
+```
+src/
+├── index.ts              # MCP server + 16 tool registrations
+├── types.ts              # Shared TypeScript interfaces
+└── clients/
+    ├── rest-api.ts       # Pipedream REST API v1 client
+    └── connect-api.ts    # Pipedream Connect API client (OAuth2)
+```
