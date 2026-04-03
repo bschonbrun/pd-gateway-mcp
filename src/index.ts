@@ -12,7 +12,7 @@ const env = (key: string): string => {
   return val;
 };
 
-const rest = new PipedreamRestClient(env('PIPEDREAM_API_KEY'));
+const rest = new PipedreamRestClient(env('PIPEDREAM_API_KEY'), process.env.PIPEDREAM_ORG_ID);
 const connect = new PipedreamConnectClient(
   env('PIPEDREAM_CLIENT_ID'),
   env('PIPEDREAM_CLIENT_SECRET'),

@@ -5,15 +5,23 @@
 const BASE_URL = 'https://api.pipedream.com/v1';
 
 export class PipedreamRestClient {
-  constructor(private apiKey: string) {}
+  private orgId?: string;
+
+  constructor(private apiKey: string, orgId?: string) {
+    this.orgId = orgId;
+  }
 
   private async request(path: string, options: RequestInit = {}) {
-    const res = await fetch(`${BASE_URL}${path}`, {
+    const url = this.orgId
+      ? `${BASE_URL}${path}${path.includes('?') ? '&' : '?'}org_id=${this.orgId}`
+      : `${BASE_URL}${path}`;
+
+    const res = await fetch(url, {
       ...options,
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
-        ...options.headers,
+        ...(options.headers as Record<string, string>),
       },
     });
     if (!res.ok) throw new Error(`Pipedream API error: ${res.status} ${await res.text()}`);
@@ -41,3 +49,4 @@ export class PipedreamRestClient {
     return { status: res.status, body: await res.text() };
   }
 }
+
