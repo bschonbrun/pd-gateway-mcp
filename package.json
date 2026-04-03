@@ -1,0 +1,24 @@
+{
+  "name": "pd-gateway-mcp",
+  "version": "0.1.0",
+  "description": "Lightweight MCP gateway for Pipedream — workflow management + 10,000 app actions through 7 tools",
+  "main": "dist/index.js",
+  "bin": {
+    "pd-gateway-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["mcp", "pipedream", "gateway", "ai", "automation"],
+  "author": "bschonbrun",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0"
+  }
+}
