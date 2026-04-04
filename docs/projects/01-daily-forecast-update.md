@@ -2,6 +2,8 @@
 
 Send a daily revenue and forecast summary to leadership via WhatsApp, Slack, and Email — fully automated, no dashboard required.
 
+> **No LLM required.** The format is fixed, the data is structured, and aggregation is handled in SQL. This is a pure data pipeline: query → template → send.
+
 ## Overview
 
 A scheduled Pipedream workflow queries Supabase for the latest revenue data, formats it using Claude, and pushes it to all configured channels simultaneously. Replaces manual reporting and ensures the team starts each day with a clear financial picture.
@@ -11,9 +13,9 @@ A scheduled Pipedream workflow queries Supabase for the latest revenue data, for
 - [x] WhatsApp channel (Twilio) — connected and tested
 - [x] Slack channel — connected
 - [x] Email channel (Outlook) — connected
-- [ ] Supabase query — in progress
-- [ ] Claude formatting layer — pending API key
+- [ ] Supabase query — confirm table/column names
 - [ ] Pipedream scheduled workflow — not built
+- [ ] Message template string — not built
 - [ ] Multi-recipient configuration — not built
 
 ## Architecture
@@ -22,14 +24,14 @@ A scheduled Pipedream workflow queries Supabase for the latest revenue data, for
 Pipedream Scheduled Trigger (daily, 7am PT)
         │
         ▼
-Supabase Query
+Supabase Query (single aggregated SQL)
   → MTD actual revenue by market
   → MTD forecast by market
   → Variance (actual - forecast)
   → Top/bottom performing markets
         │
         ▼
-Claude API (format into clean summary)
+Template string (hardcoded format, filled with query results)
         │
         ▼
 Fan out in parallel:
@@ -81,11 +83,9 @@ GROUP BY market ORDER BY forecast DESC;
 | WhatsApp recipients | `+16047830407` (expand as needed) |
 | Slack channel | `#revenue` or `#leadership` |
 | Email recipients | Distribution list TBD |
-| Claude model | `claude-sonnet-4-5` |
 
 ## Dependencies
 
-- Anthropic API key (Claude)
 - Supabase project URL + service_role key for the manufacturing dashboard project
 - Confirm table/column names for revenue data
 
