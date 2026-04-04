@@ -58,9 +58,9 @@ export class PipedreamConnectClient {
   }
 
   async runAction(actionKey: string, props: Record<string, unknown>, externalUserId: string) {
-    return this.request(`/actions/${actionKey}/run`, {
+    return this.request('/actions/run', {
       method: 'POST',
-      body: JSON.stringify({ external_user_id: externalUserId, configured_props: props }),
+      body: JSON.stringify({ id: actionKey, external_user_id: externalUserId, configured_props: props }),
     });
   }
 
