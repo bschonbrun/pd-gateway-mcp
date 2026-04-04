@@ -259,12 +259,52 @@ server.tool(
   },
 );
 
+// ── WhatsApp Tool (Twilio Direct) ───────────────────────────────────
+
+const TWILIO_SID = process.env['TWILIO_ACCOUNT_SID'] || '';
+const TWILIO_TOKEN = process.env['TWILIO_AUTH_TOKEN'] || '';
+const TWILIO_WA_FROM = process.env['TWILIO_WHATSAPP_FROM'] || 'whatsapp:+14155238886';
+
+server.tool(
+  'send_whatsapp',
+  'Send a WhatsApp message via Twilio. Bypasses Pipedream component limitations. Supports text messages to any WhatsApp number.',
+  {
+    to: z.string().describe('Recipient phone number with country code (e.g. "+16045551234"). The whatsapp: prefix is added automatically.'),
+    body: z.string().max(1600).describe('Message text (max 1600 chars). Supports WhatsApp formatting: *bold*, _italic_, ~strikethrough~, ```monospace```'),
+    from: z.string().optional().describe('Override sender WhatsApp number (defaults to sandbox number)'),
+    media_url: z.string().url().optional().describe('Optional media URL to attach (image, PDF, etc.)'),
+  },
+  async ({ to, body, from, media_url }) => {
+    if (!TWILIO_SID || !TWILIO_TOKEN) return fail('TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set');
+
+    const waTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+    const waFrom = from ? (from.startsWith('whatsapp:') ? from : `whatsapp:${from}`) : TWILIO_WA_FROM;
+
+    const params = new URLSearchParams({ To: waTo, From: waFrom, Body: body });
+    if (media_url) params.append('MediaUrl', media_url);
+
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
+    const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      });
+      const data = await res.json();
+      if (!res.ok) return fail(`Twilio ${res.status}: ${data.message || JSON.stringify(data)}`);
+      return ok({ sid: data.sid, status: data.status, to: data.to, from: data.from, date_created: data.date_created });
+    } catch (e) { return fail(e); }
+  },
+);
+
 // ── Start ───────────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('pd-gateway-mcp: running (16 tools)');
+  console.error('pd-gateway-mcp: running (17 tools)');
 }
 
 main().catch((err) => {
