@@ -299,12 +299,56 @@ server.tool(
   },
 );
 
+// ── Claude Tool (Anthropic Direct) ──────────────────────────────────
+
+const ANTHROPIC_API_KEY = process.env['ANTHROPIC_API_KEY'] || '';
+
+server.tool(
+  'ask_claude',
+  'Send a message to Claude (claude-sonnet-4-5). Use for: formatting data into readable summaries, answering natural language questions about structured data, generating SQL from plain English, or any task requiring reasoning. Returns Claude\'s response as text.',
+  {
+    prompt: z.string().describe('The user message / question to send to Claude'),
+    system: z.string().optional().describe('Optional system prompt to set Claude\'s role and context (e.g. database schema, formatting rules)'),
+    model: z.enum(['claude-opus-4-5', 'claude-sonnet-4-5', 'claude-haiku-4-5']).default('claude-sonnet-4-5').describe('Claude model to use'),
+    max_tokens: z.number().min(100).max(8192).default(1024).describe('Maximum tokens in response'),
+  },
+  async ({ prompt, system, model, max_tokens }) => {
+    if (!ANTHROPIC_API_KEY) return fail('ANTHROPIC_API_KEY must be set');
+
+    const body: Record<string, unknown> = {
+      model,
+      max_tokens,
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (system) body.system = system;
+
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json() as {
+        content?: Array<{ type: string; text: string }>;
+        error?: { message: string };
+      };
+      if (!res.ok) return fail(`Anthropic ${res.status}: ${data.error?.message || JSON.stringify(data)}`);
+      const text = data.content?.find(b => b.type === 'text')?.text ?? '';
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (e) { return fail(e); }
+  },
+);
+
 // ── Start ───────────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('pd-gateway-mcp: running (17 tools)');
+  console.error('pd-gateway-mcp: running (18 tools)');
 }
 
 main().catch((err) => {
