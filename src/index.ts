@@ -343,12 +343,306 @@ server.tool(
   },
 );
 
+// ── Daily Digest Tool ──────────────────────────────────────────────
+
+const SUPABASE_URL = process.env['SUPABASE_URL'] || '';
+const SUPABASE_ANON_KEY = process.env['SUPABASE_ANON_KEY'] || '';
+const SLACK_AUTH_PROVISION = process.env['SLACK_AUTH_PROVISION_ID'] || 'apn_P8hEEEa';
+const OUTLOOK_AUTH_PROVISION = process.env['OUTLOOK_AUTH_PROVISION_ID'] || 'apn_Xeh00n7';
+const SLACK_CHANNEL_ID = process.env['SLACK_DIGEST_CHANNEL'] || 'C0872NV9H43';
+const EMAIL_RECIPIENTS = (process.env['DIGEST_EMAIL_RECIPIENTS'] || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com').split(',');
+
+function fmt(n: number): string {
+  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (Math.abs(n) >= 1_000) return `$${Math.round(n / 1_000)}K`;
+  return n === 0 ? '—' : `$${n.toLocaleString()}`;
+}
+
+function fmtExact(n: number): string {
+  const prefix = n < 0 ? '-$' : '$';
+  return prefix + Math.abs(Math.round(n)).toLocaleString();
+}
+
+function fmtGap(n: number): string {
+  const prefix = n < 0 ? '-$' : '+$';
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${prefix}${(abs / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${prefix}${Math.round(abs / 1_000)}K`;
+  return `${prefix}${abs.toLocaleString()}`;
+}
+
+function pad(s: string, w: number): string { return s.padEnd(w); }
+function rpad(s: string, w: number): string { return s.padStart(w); }
+
+interface DigestData {
+  report_date: string; day_of_month: number; days_in_month: number; current_quarter: number;
+  ytd: { actual: number; forecast: number; target: number };
+  quarters: Array<{ label: string; target: number; forecast: number; actual: number; orders: number; totes: number; is_closed: boolean; is_current: boolean }>;
+  months: Array<{ label: string; target: number; forecast: number; actual: number; orders: number; totes: number; is_closed: boolean; is_current: boolean }>;
+  top_customers: Array<{ name: string; revenue: number; orders: number; top_product: string | null }> | null;
+  forecast_gaps: Array<{ name: string; forecast: number; actual: number; gap: number }> | null;
+  top_products: Array<{ product: string; product_type: string; forecast: number; actual: number; gap: number }> | null;
+  largest_orders: Array<{ order_number: number; customer: string; product: string; revenue: number; totes: number; order_date: string }> | null;
+}
+
+function periodTag(q: { is_closed: boolean; is_current: boolean }): string {
+  if (q.is_closed) return ' (Last)';
+  if (q.is_current) return ' ◀';
+  return ' (Next)';
+}
+
+function formatSlack(d: DigestData): string {
+  const lines: string[] = [
+    `*📊 CarboNet Daily Digest — ${d.report_date}*`,
+    '',
+    `*━━━ YTD Summary ━━━*`,
+    `Actual ${fmt(d.ytd.actual)} · Forecast ${fmt(d.ytd.forecast)} · Target ${fmt(d.ytd.target)}`,
+    '',
+    `*━━━ Quarterly ━━━*`,
+    '```',
+    `${pad('', 12)} ${rpad('Target', 9)} ${rpad('Forecast', 9)} ${rpad('Actual', 9)} ${rpad('Orders', 7)} ${rpad('Totes', 6)}`,
+  ];
+  for (const q of d.quarters) {
+    const tag = periodTag(q);
+    lines.push(
+      `${pad(q.label + tag, 12)} ${rpad(fmt(q.target), 9)} ${rpad(fmt(q.forecast), 9)} ${rpad(q.actual ? fmt(q.actual) : '—', 9)} ${rpad(q.orders ? String(q.orders) : '—', 7)} ${rpad(q.totes ? String(q.totes) : '—', 6)}`,
+    );
+  }
+  lines.push('```', '');
+
+  lines.push(`*━━━ Monthly ━━━*`, '```');
+  lines.push(`${pad('', 12)} ${rpad('Target', 9)} ${rpad('Forecast', 9)} ${rpad('Actual', 9)} ${rpad('Orders', 7)} ${rpad('Totes', 6)}`);
+  for (const m of d.months) {
+    const tag = periodTag(m);
+    lines.push(
+      `${pad(m.label + tag, 12)} ${rpad(fmt(m.target), 9)} ${rpad(fmt(m.forecast), 9)} ${rpad(m.actual ? fmt(m.actual) : '—', 9)} ${rpad(m.orders ? String(m.orders) : '—', 7)} ${rpad(m.totes ? String(m.totes) : '—', 6)}`,
+    );
+  }
+  lines.push('```', '');
+
+  if (d.top_customers?.length) {
+    lines.push(`*━━━ Top 5 Customers MTD ━━━*`, '```');
+    lines.push(`${pad('Customer', 20)} ${rpad('Revenue', 10)} ${rpad('Ord', 4)} ${pad('Top Product', 20)}`);
+    for (const c of d.top_customers) {
+      lines.push(`${pad(c.name.slice(0, 19), 20)} ${rpad(fmt(c.revenue), 10)} ${rpad(String(c.orders), 4)} ${pad((c.top_product || '—').slice(0, 19), 20)}`);
+    }
+    lines.push('```', '');
+  }
+
+  if (d.top_products?.length) {
+    lines.push(`*━━━ Top 5 Products MTD ━━━*`, '```');
+    lines.push(`${pad('Product', 22)} ${rpad('Forecast', 10)} ${rpad('Actual', 10)} ${rpad('Gap', 10)}`);
+    for (const p of d.top_products) {
+      lines.push(`${pad(p.product.slice(0, 21), 22)} ${rpad(fmt(p.forecast), 10)} ${rpad(p.actual ? fmt(p.actual) : '—', 10)} ${rpad(fmtGap(p.gap), 10)}`);
+    }
+    lines.push('```', '');
+  }
+
+  if (d.forecast_gaps?.length) {
+    lines.push(`*━━━ Top 5 Forecast Gaps MTD ━━━*`, '```');
+    lines.push(`${pad('Customer', 20)} ${rpad('Forecast', 10)} ${rpad('Actual', 10)} ${rpad('Gap', 10)}`);
+    for (const g of d.forecast_gaps) {
+      lines.push(`${pad(g.name.slice(0, 19), 20)} ${rpad(fmt(g.forecast), 10)} ${rpad(g.actual ? fmt(g.actual) : '—', 10)} ${rpad(fmtGap(g.gap), 10)}`);
+    }
+    lines.push('```', '');
+  }
+
+  if (d.largest_orders?.length) {
+    lines.push(`*━━━ Top 5 Largest Orders MTD ━━━*`, '```');
+    lines.push(`${pad('Order', 10)} ${pad('Customer', 18)} ${pad('Product', 20)} ${rpad('Revenue', 9)} ${pad('Date', 6)}`);
+    for (const o of d.largest_orders) {
+      lines.push(`${pad(String(o.order_number), 10)} ${pad(o.customer.slice(0, 17), 18)} ${pad((o.product || '—').slice(0, 19), 20)} ${rpad(fmt(o.revenue), 9)} ${pad(o.order_date, 6)}`);
+    }
+    lines.push('```');
+  }
+
+  return lines.join('\n');
+}
+
+function htmlTable(headers: string[], rows: string[][], opts?: { rightAlign?: number[]; highlightRows?: number[] }): string {
+  const th = (h: string, i: number) =>
+    `<th style="padding:8px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #ddd;background:#f2f2f2">${h}</th>`;
+  const td = (v: string, i: number, ri: number) => {
+    const isCurrent = opts?.highlightRows?.includes(ri);
+    const bg = isCurrent ? 'background:#e8f4fd;font-weight:600;' : (ri % 2 === 1 ? 'background:#f9f9f9' : '');
+    return `<td style="padding:6px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #ddd;${bg}">${v}</td>`;
+  };
+  return `<table style="border-collapse:collapse;font-size:13px;width:100%;margin-bottom:16px">
+<tr>${headers.map(th).join('')}</tr>
+${rows.map((r, ri) => `<tr>${r.map((v, i) => td(v, i, ri)).join('')}</tr>`).join('\n')}
+</table>`;
+}
+
+function formatEmail(d: DigestData): string {
+  const ra = [1, 2, 3, 4, 5, 6];
+
+  const ytdTable = htmlTable(
+    ['Metric', 'Value'],
+    [['Actual', fmt(d.ytd.actual)], ['Forecast', fmt(d.ytd.forecast)], ['Target', fmt(d.ytd.target)]],
+    { rightAlign: [1] },
+  );
+
+  const qHighlight = d.quarters.map((q, i) => q.is_current ? i : -1).filter(i => i >= 0);
+  const qTable = htmlTable(
+    ['Quarter', 'Target', 'Forecast', 'Actual', 'Orders', 'Totes'],
+    d.quarters.map(q => [q.label + periodTag(q), fmt(q.target), fmt(q.forecast), q.actual ? fmt(q.actual) : '—', q.orders ? String(q.orders) : '—', q.totes ? String(q.totes) : '—']),
+    { rightAlign: ra, highlightRows: qHighlight },
+  );
+
+  const mHighlight = d.months.map((m, i) => m.is_current ? i : -1).filter(i => i >= 0);
+  const mTable = htmlTable(
+    ['Month', 'Target', 'Forecast', 'Actual', 'Orders', 'Totes'],
+    d.months.map(m => [m.label + periodTag(m), fmt(m.target), fmt(m.forecast), m.actual ? fmt(m.actual) : '—', m.orders ? String(m.orders) : '—', m.totes ? String(m.totes) : '—']),
+    { rightAlign: ra, highlightRows: mHighlight },
+  );
+
+  const custTable = d.top_customers?.length ? `<h3 style="margin:16px 0 8px">Top 5 Customers MTD</h3>` + htmlTable(
+    ['Customer', 'Revenue', 'Orders', 'Top Product'],
+    d.top_customers.map(c => [c.name, fmt(c.revenue), String(c.orders), c.top_product || '—']),
+    { rightAlign: [1, 2] },
+  ) : '';
+
+  const productTable = d.top_products?.length ? `<h3 style="margin:16px 0 8px">Top 5 Products MTD</h3>` + htmlTable(
+    ['Product', 'Type', 'Forecast', 'Actual', 'Gap'],
+    d.top_products.map(p => [p.product, p.product_type, fmt(p.forecast), p.actual ? fmt(p.actual) : '—', `<span style="color:${p.gap < 0 ? '#c00' : '#080'}">${fmtGap(p.gap)}</span>`]),
+    { rightAlign: [2, 3, 4] },
+  ) : '';
+
+  const gapTable = d.forecast_gaps?.length ? `<h3 style="margin:16px 0 8px">Top 5 Forecast Gaps MTD</h3>` + htmlTable(
+    ['Customer', 'Forecast', 'Actual', 'Gap'],
+    d.forecast_gaps.map(g => [g.name, fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#c00' : '#080'}">${fmtGap(g.gap)}</span>`]),
+    { rightAlign: [1, 2, 3] },
+  ) : '';
+
+  const ordersTable = d.largest_orders?.length ? `<h3 style="margin:16px 0 8px">Top 5 Largest Orders MTD</h3>` + htmlTable(
+    ['Order #', 'Customer', 'Product', 'Revenue', 'Totes', 'Date'],
+    d.largest_orders.map(o => [String(o.order_number), o.customer, o.product || '—', fmt(o.revenue), String(o.totes), o.order_date]),
+    { rightAlign: [3, 4] },
+  ) : '';
+
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1a1a1a">
+<h2 style="margin-bottom:4px">📊 CarboNet Daily Digest</h2>
+<p style="color:#666;margin-top:0">${d.report_date}</p>
+<h3 style="margin:16px 0 8px">YTD Summary</h3>${ytdTable}
+<h3 style="margin:16px 0 8px">Quarterly Performance</h3>${qTable}
+<h3 style="margin:16px 0 8px">Monthly Performance</h3>${mTable}
+${custTable}${productTable}${gapTable}${ordersTable}
+</div>`;
+}
+
+function formatWhatsApp(d: DigestData): string {
+  const lines: string[] = [
+    `📊 *CarboNet Daily Digest — ${d.report_date}*`,
+    '',
+    `*YTD Summary*`,
+    `Actual ${fmt(d.ytd.actual)} · Forecast ${fmt(d.ytd.forecast)} · Target ${fmt(d.ytd.target)}`,
+    '',
+    `*Quarterly*`,
+    '```',
+  ];
+  for (const q of d.quarters) {
+    const tag = periodTag(q);
+    lines.push(`${q.label}${tag} T:${fmt(q.target)} F:${fmt(q.forecast)} A:${q.actual ? fmt(q.actual) : '—'}`);
+  }
+  lines.push('```', '', `*Monthly*`, '```');
+  for (const m of d.months) {
+    const tag = periodTag(m);
+    lines.push(`${m.label}${tag} T:${fmt(m.target)} F:${fmt(m.forecast)} A:${m.actual ? fmt(m.actual) : '—'}`);
+  }
+  lines.push('```');
+
+  if (d.top_customers?.length) {
+    lines.push('', `*Top 5 Customers MTD*`, '```');
+    for (const c of d.top_customers) lines.push(`${pad(c.name.slice(0, 16), 17)} ${fmt(c.revenue)}`);
+    lines.push('```');
+  }
+
+  if (d.top_products?.length) {
+    lines.push('', `*Top Products MTD*`, '```');
+    for (const p of d.top_products) lines.push(`${pad(p.product.slice(0, 18), 19)} F:${fmt(p.forecast)} A:${p.actual ? fmt(p.actual) : '—'}`);
+    lines.push('```');
+  }
+
+  if (d.largest_orders?.length) {
+    lines.push('', `*Largest Orders*`, '```');
+    for (const o of d.largest_orders) lines.push(`${o.order_date} ${pad(o.customer.slice(0, 14), 15)} ${fmt(o.revenue)}`);
+    lines.push('```');
+  }
+
+  return lines.join('\n');
+}
+
+server.tool(
+  'run_daily_digest',
+  'Run the CarboNet daily revenue digest. Queries live Supabase data and sends formatted reports to Slack (#orders-glide) and Outlook email recipients.',
+  {
+    dry_run: z.boolean().default(false).describe('If true, returns the formatted messages without sending them'),
+    channels: z.array(z.enum(['slack', 'email'])).default(['slack', 'email']).describe('Which channels to send to'),
+  },
+  async ({ dry_run, channels }) => {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return fail('SUPABASE_URL and SUPABASE_ANON_KEY must be set');
+
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/digest_full`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    if (!res.ok) return fail(`Supabase error ${res.status}: ${await res.text()}`);
+    const d = await res.json() as DigestData;
+
+    const slackText = formatSlack(d);
+    const emailBody = formatEmail(d);
+    const whatsAppText = formatWhatsApp(d);
+
+    if (dry_run) return ok({ slackText, emailBody, whatsAppText, recipients: EMAIL_RECIPIENTS, data: d });
+
+    const results: Record<string, unknown> = {};
+
+    if (channels.includes('slack')) {
+      try {
+        results.slack = await connect.runAction('slack-send-message', {
+          slack: { authProvisionId: SLACK_AUTH_PROVISION },
+          conversation: SLACK_CHANNEL_ID,
+          text: slackText,
+          mrkdwn: true,
+          include_sent_via_pipedream_flag: false,
+          customizeBotSettings: true,
+          username: 'BillSuite',
+          icon_emoji: ':bar_chart:',
+        }, defaultUserId);
+      } catch (e) {
+        results.slack_error = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    if (channels.includes('email')) {
+      try {
+        results.email = await connect.runAction('microsoft_outlook-send-email', {
+          microsoftOutlook: { authProvisionId: OUTLOOK_AUTH_PROVISION },
+          recipients: EMAIL_RECIPIENTS,
+          subject: `Daily Revenue Tracker — ${d.report_date}`,
+          contentType: 'html',
+          content: emailBody,
+        }, defaultUserId);
+      } catch (e) {
+        results.email_error = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    return ok({ sent: true, channels, summary: { ytd: fmt(d.ytd.actual), forecast: fmt(d.ytd.forecast) }, results });
+  },
+);
+
 // ── Start ───────────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('pd-gateway-mcp: running (18 tools)');
+  console.error('pd-gateway-mcp: running (19 tools)');
 }
 
 main().catch((err) => {
