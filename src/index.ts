@@ -263,7 +263,7 @@ server.tool(
 
 const TWILIO_SID = process.env['TWILIO_ACCOUNT_SID'] || '';
 const TWILIO_TOKEN = process.env['TWILIO_AUTH_TOKEN'] || '';
-const TWILIO_WA_FROM = process.env['TWILIO_WHATSAPP_FROM'] || 'whatsapp:+14155238886';
+const TWILIO_WA_FROM = process.env['TWILIO_WHATSAPP_FROM'] || 'whatsapp:+12362332112';
 
 server.tool(
   'send_whatsapp',
@@ -351,6 +351,8 @@ const SLACK_AUTH_PROVISION = process.env['SLACK_AUTH_PROVISION_ID'] || 'apn_P8hE
 const OUTLOOK_AUTH_PROVISION = process.env['OUTLOOK_AUTH_PROVISION_ID'] || 'apn_Xeh00n7';
 const SLACK_CHANNEL_ID = process.env['SLACK_DIGEST_CHANNEL'] || 'C0872NV9H43';
 const EMAIL_RECIPIENTS = (process.env['DIGEST_EMAIL_RECIPIENTS'] || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com').split(',');
+const WHATSAPP_RECIPIENTS = (process.env['DIGEST_WHATSAPP_RECIPIENTS'] || '+16047830407').split(',');
+const DIGEST_TEMPLATE_SID = process.env['DIGEST_TEMPLATE_SID'] || 'HX866924f28f9baef9bd26c443593b8a02';
 
 function fmt(n: number): string {
   if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
@@ -530,24 +532,40 @@ ${custTable}${productTable}${gapTable}${ordersTable}
 </div>`;
 }
 
+function fmtDateShort(reportDate: string): string {
+  const d = new Date(reportDate);
+  if (isNaN(d.getTime())) return reportDate;
+  return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${String(d.getFullYear()).slice(-2)}`;
+}
+
+function fmtShort(n: number): string {
+  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(n) >= 1_000) return `$${Math.round(n / 1_000)}K`;
+  return n === 0 ? '—' : `$${n.toLocaleString()}`;
+}
+
 function formatWhatsApp(d: DigestData): string {
+  const shortDt = fmtDateShort(d.report_date).slice(0, 5); // MM/DD only
+  const s = fmtShort;
   const lines: string[] = [
-    `📊 *CarboNet Daily Digest — ${d.report_date}*`,
+    `*Revenue Update - ${shortDt}*`,
     '',
-    `*YTD Summary*`,
-    `Actual ${fmt(d.ytd.actual)} · Forecast ${fmt(d.ytd.forecast)} · Target ${fmt(d.ytd.target)}`,
+    `*YTD*`,
+    `Actual: ${s(d.ytd.actual)}`,
+    `Forecast: ${s(d.ytd.forecast)}`,
+    `Target: ${s(d.ytd.target)}`,
     '',
     `*Quarterly*`,
     '```',
   ];
   for (const q of d.quarters) {
-    const tag = periodTag(q);
-    lines.push(`${q.label}${tag} T:${fmt(q.target)} F:${fmt(q.forecast)} A:${q.actual ? fmt(q.actual) : '—'}`);
+    const marker = q.is_current ? ' ◀' : '';
+    lines.push(`${pad(q.label, 3)}T:${s(q.target)} F:${s(q.forecast)} A:${q.actual ? s(q.actual) : '—'}${marker}`);
   }
   lines.push('```', '', `*Monthly*`, '```');
   for (const m of d.months) {
-    const tag = periodTag(m);
-    lines.push(`${m.label}${tag} T:${fmt(m.target)} F:${fmt(m.forecast)} A:${m.actual ? fmt(m.actual) : '—'}`);
+    const marker = m.is_current ? ' ◀' : '';
+    lines.push(`${pad(m.label, 4)}T:${s(m.target)} F:${s(m.forecast)} A:${m.actual ? s(m.actual) : '—'}${marker}`);
   }
   lines.push('```');
 
@@ -559,7 +577,7 @@ function formatWhatsApp(d: DigestData): string {
 
   if (d.top_products?.length) {
     lines.push('', `*Top Products MTD*`, '```');
-    for (const p of d.top_products) lines.push(`${pad(p.product.slice(0, 18), 19)} F:${fmt(p.forecast)} A:${p.actual ? fmt(p.actual) : '—'}`);
+    for (const p of d.top_products) lines.push(`${pad(p.product.slice(0, 20), 21)} ${p.actual ? fmt(p.actual) : '—'}`);
     lines.push('```');
   }
 
@@ -577,7 +595,7 @@ server.tool(
   'Run the CarboNet daily revenue digest. Queries live Supabase data and sends formatted reports to Slack (#orders-glide) and Outlook email recipients.',
   {
     dry_run: z.boolean().default(false).describe('If true, returns the formatted messages without sending them'),
-    channels: z.array(z.enum(['slack', 'email'])).default(['slack', 'email']).describe('Which channels to send to'),
+    channels: z.array(z.enum(['slack', 'email', 'whatsapp'])).default(['slack', 'email']).describe('Which channels to send to'),
   },
   async ({ dry_run, channels }) => {
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return fail('SUPABASE_URL and SUPABASE_ANON_KEY must be set');
@@ -630,6 +648,57 @@ server.tool(
         }, defaultUserId);
       } catch (e) {
         results.email_error = e instanceof Error ? e.message : String(e);
+      }
+    }
+
+    if (channels.includes('whatsapp')) {
+      try {
+        const currentMonth = d.months.find(m => m.is_current) || d.months[0];
+        const dt = fmtDateShort(d.report_date);
+        const contentVars = JSON.stringify({
+          '1': dt,
+          '2': fmtExact(d.ytd.actual),
+          '3': fmtExact(d.ytd.forecast),
+          '4': fmtExact(d.ytd.target),
+          '5': currentMonth?.actual ? fmtExact(currentMonth.actual) : '—',
+          '6': fmtExact(currentMonth?.forecast || 0),
+        });
+        const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
+        const waResults: Array<{ to: string; template: string; detail: string }> = [];
+        for (const recipient of WHATSAPP_RECIPIENTS) {
+          const waTo = recipient.startsWith('whatsapp:') ? recipient : `whatsapp:${recipient.trim()}`;
+          // Step 1: Send template (opens conversation window)
+          const tplParams = new URLSearchParams({
+            To: waTo, From: TWILIO_WA_FROM,
+            ContentSid: DIGEST_TEMPLATE_SID, ContentVariables: contentVars,
+          });
+          const tplRes = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
+            method: 'POST',
+            headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: tplParams.toString(),
+          });
+          const tplData = await tplRes.json() as Record<string, unknown>;
+          if (!tplRes.ok) {
+            waResults.push({ to: recipient, template: 'failed', detail: String(tplData['message'] || tplRes.status) });
+            continue;
+          }
+          // Step 2: Send full report as freeform follow-up
+          const freeParams = new URLSearchParams({ To: waTo, From: TWILIO_WA_FROM, Body: whatsAppText });
+          const freeRes = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
+            method: 'POST',
+            headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: freeParams.toString(),
+          });
+          const freeData = await freeRes.json() as Record<string, unknown>;
+          waResults.push({
+            to: recipient,
+            template: String(tplData['sid']),
+            detail: freeRes.ok ? String(freeData['sid']) : `follow-up failed: ${freeData['message']}`,
+          });
+        }
+        results.whatsapp = waResults;
+      } catch (e) {
+        results.whatsapp_error = e instanceof Error ? e.message : String(e);
       }
     }
 
