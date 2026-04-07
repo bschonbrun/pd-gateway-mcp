@@ -352,7 +352,7 @@ const OUTLOOK_AUTH_PROVISION = process.env['OUTLOOK_AUTH_PROVISION_ID'] || 'apn_
 const SLACK_CHANNEL_ID = process.env['SLACK_DIGEST_CHANNEL'] || 'C0872NV9H43';
 const EMAIL_RECIPIENTS = (process.env['DIGEST_EMAIL_RECIPIENTS'] || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com,graeme@carbonet.com').split(',');
 const WHATSAPP_RECIPIENTS = (process.env['DIGEST_WHATSAPP_RECIPIENTS'] || '+16047830407').split(',');
-const DIGEST_TEMPLATE_SID = process.env['DIGEST_TEMPLATE_SID'] || 'HX866924f28f9baef9bd26c443593b8a02';
+const DIGEST_TEMPLATE_SID = process.env['DIGEST_TEMPLATE_SID'] || 'HX6f733603e2f8ffb785fcf131f872565a';
 
 function fmt(n: number): string {
   if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
@@ -654,14 +654,10 @@ server.tool(
     if (channels.includes('whatsapp')) {
       try {
         const currentMonth = d.months.find(m => m.is_current) || d.months[0];
-        const dt = fmtDateShort(d.report_date);
+        const s = fmtShort;
         const contentVars = JSON.stringify({
-          '1': dt,
-          '2': fmtExact(d.ytd.actual),
-          '3': fmtExact(d.ytd.forecast),
-          '4': fmtExact(d.ytd.target),
-          '5': currentMonth?.actual ? fmtExact(currentMonth.actual) : '—',
-          '6': fmtExact(currentMonth?.forecast || 0),
+          '1': currentMonth?.actual ? s(currentMonth.actual) : '—',
+          '2': s(currentMonth?.forecast || 0),
         });
         const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
         const waResults: Array<{ to: string; template: string; detail: string }> = [];
@@ -682,7 +678,8 @@ server.tool(
             waResults.push({ to: recipient, template: 'failed', detail: String(tplData['message'] || tplRes.status) });
             continue;
           }
-          // Step 2: Send full report as freeform follow-up
+          // Step 2: Wait 15s so template arrives first, then send full report
+          await new Promise(r => setTimeout(r, 15_000));
           const freeParams = new URLSearchParams({ To: waTo, From: TWILIO_WA_FROM, Body: whatsAppText });
           const freeRes = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
             method: 'POST',
