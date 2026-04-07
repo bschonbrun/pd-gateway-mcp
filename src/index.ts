@@ -350,7 +350,7 @@ const SUPABASE_ANON_KEY = process.env['SUPABASE_ANON_KEY'] || '';
 const SLACK_AUTH_PROVISION = process.env['SLACK_AUTH_PROVISION_ID'] || 'apn_P8hEEEa';
 const OUTLOOK_AUTH_PROVISION = process.env['OUTLOOK_AUTH_PROVISION_ID'] || 'apn_Xeh00n7';
 const SLACK_CHANNEL_ID = process.env['SLACK_DIGEST_CHANNEL'] || 'C0872NV9H43';
-const EMAIL_RECIPIENTS = (process.env['DIGEST_EMAIL_RECIPIENTS'] || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com').split(',');
+const EMAIL_RECIPIENTS = (process.env['DIGEST_EMAIL_RECIPIENTS'] || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com,graeme@carbonet.com').split(',');
 const WHATSAPP_RECIPIENTS = (process.env['DIGEST_WHATSAPP_RECIPIENTS'] || '+16047830407').split(',');
 const DIGEST_TEMPLATE_SID = process.env['DIGEST_TEMPLATE_SID'] || 'HX866924f28f9baef9bd26c443593b8a02';
 
