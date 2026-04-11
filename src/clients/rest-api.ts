@@ -48,5 +48,17 @@ export class PipedreamRestClient {
     });
     return { status: res.status, body: await res.text() };
   }
+
+  async createWorkflow(body: Record<string, unknown>) {
+    return this.request('/workflows', { method: 'POST', body: JSON.stringify(body) });
+  }
+
+  async updateWorkflow(id: string, patch: Record<string, unknown>) {
+    return this.request(`/workflows/${id}`, { method: 'PUT', body: JSON.stringify(patch) });
+  }
+
+  async deleteWorkflow(id: string) {
+    return this.request(`/workflows/${id}`, { method: 'DELETE' });
+  }
 }
 

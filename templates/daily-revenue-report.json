@@ -1,0 +1,135 @@
+{
+  "id": "daily-revenue-report",
+  "version": "1.0.0",
+  "name": "Daily Revenue Report",
+  "description": "Sends a formatted revenue summary on a schedule. Queries Supabase for YTD, quarterly, and monthly actuals vs forecast, plus top customers, products, and orders. Delivers to Slack, email, and/or WhatsApp.",
+
+  "parameters": [
+    {
+      "name": "schedule",
+      "type": "cron",
+      "default": "0 15 * * 1-5",
+      "label": "When to send",
+      "description": "Default: weekdays at 8:00am PT (15:00 UTC)"
+    },
+    {
+      "name": "channels",
+      "type": "multi-select",
+      "options": ["slack", "email", "whatsapp"],
+      "default": ["slack", "email"],
+      "label": "Delivery channels"
+    },
+    {
+      "name": "email_recipients",
+      "type": "list",
+      "label": "Email recipients",
+      "default": [
+        "barry@carbonet.com",
+        "lindsay@carbonet.com",
+        "jack@carbonet.com",
+        "amielle@carbonet.com",
+        "buster@carbonet.com",
+        "mike@carbonet.com",
+        "paul@carbonet.com",
+        "nolan@carbonet.com",
+        "bill@carbonet.com",
+        "graeme@carbonet.com"
+      ]
+    },
+    {
+      "name": "whatsapp_recipients",
+      "type": "list",
+      "label": "WhatsApp recipients (E.164 format)",
+      "default": ["+16047830407"]
+    },
+    {
+      "name": "slack_channel_id",
+      "type": "string",
+      "label": "Slack channel ID",
+      "default": "C0872NV9H43"
+    },
+    {
+      "name": "slack_bot_name",
+      "type": "string",
+      "label": "Slack bot display name",
+      "default": "BillSuite"
+    },
+    {
+      "name": "email_subject_prefix",
+      "type": "string",
+      "label": "Email subject prefix",
+      "default": "Daily Revenue Tracker"
+    },
+    {
+      "name": "whatsapp_template_sid",
+      "type": "string",
+      "label": "Twilio WhatsApp template SID",
+      "default": "HX6f733603e2f8ffb785fcf131f872565a",
+      "description": "Meta-approved template for business-initiated messages"
+    },
+    {
+      "name": "whatsapp_template_delay_ms",
+      "type": "number",
+      "label": "Delay (ms) between template and freeform WhatsApp message",
+      "default": 15000,
+      "description": "Wait this long after sending the template before sending the full report, to ensure delivery order"
+    }
+  ],
+
+  "data_source": {
+    "type": "supabase_rpc",
+    "function": "digest_full",
+    "args": {},
+    "description": "Returns DigestData: YTD, quarterly, monthly, top customers, products, orders"
+  },
+
+  "channels": {
+    "slack": {
+      "app": "slack",
+      "action": "slack-send-message",
+      "auth_provision_env": "SLACK_AUTH_PROVISION_ID",
+      "props": {
+        "conversation": "{{slack_channel_id}}",
+        "text": "{{formatted.slack}}",
+        "mrkdwn": true,
+        "include_sent_via_pipedream_flag": false,
+        "customizeBotSettings": true,
+        "username": "{{slack_bot_name}}",
+        "icon_emoji": ":bar_chart:"
+      }
+    },
+    "email": {
+      "app": "microsoft_outlook",
+      "action": "microsoft_outlook-send-email",
+      "auth_provision_env": "OUTLOOK_AUTH_PROVISION_ID",
+      "props": {
+        "recipients": "{{email_recipients}}",
+        "subject": "{{email_subject_prefix}} — {{report_date}}",
+        "contentType": "html",
+        "content": "{{formatted.email}}"
+      }
+    },
+    "whatsapp": {
+      "provider": "twilio",
+      "auth_env": {
+        "sid": "TWILIO_ACCOUNT_SID",
+        "token": "TWILIO_AUTH_TOKEN",
+        "from": "TWILIO_WA_FROM"
+      },
+      "template_sid": "{{whatsapp_template_sid}}",
+      "template_variables": {
+        "1": "{{current_month.actual_short}}",
+        "2": "{{current_month.forecast_short}}"
+      },
+      "freeform_body": "{{formatted.whatsapp}}",
+      "recipients": "{{whatsapp_recipients}}",
+      "template_delay_ms": "{{whatsapp_template_delay_ms}}"
+    }
+  },
+
+  "runtime": {
+    "engine": "pipedream",
+    "entrypoint": "src/digest/cron.ts",
+    "notes": "The digest module is the authoritative implementation. This template defines parameters; the engine instantiates and deploys to Pipedream."
+  }
+}
