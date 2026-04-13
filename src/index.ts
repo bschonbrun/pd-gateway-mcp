@@ -354,19 +354,19 @@ const digestConfig: SenderConfig = {
   slackAuthProvisionId:     process.env['SLACK_AUTH_PROVISION_ID']    || 'apn_P8hEEEa',
   outlookAuthProvisionId:   process.env['OUTLOOK_AUTH_PROVISION_ID']  || 'apn_Xeh00n7',
   slackChannelId:           process.env['SLACK_DIGEST_CHANNEL']       || 'C0872NV9H43',
-  emailRecipients:         (process.env['DIGEST_EMAIL_RECIPIENTS']    || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com,graeme@carbonet.com').split(','),
+  emailRecipients:         (process.env['DIGEST_EMAIL_RECIPIENTS']    || 'user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com').split(','),
   emailSubjectPrefix:       process.env['DIGEST_EMAIL_SUBJECT']       || 'Daily Revenue Tracker',
   whatsappRecipients:      (process.env['DIGEST_WHATSAPP_RECIPIENTS'] || '+16047830407').split(','),
   whatsappTemplateSid:      process.env['DIGEST_TEMPLATE_SID']        || 'HX6f733603e2f8ffb785fcf131f872565a',
   whatsappTemplateDelayMs:  Number(process.env['DIGEST_WA_DELAY_MS']) || 15_000,
   twilioSid:                process.env['TWILIO_ACCOUNT_SID']         || '',
   twilioToken:              process.env['TWILIO_AUTH_TOKEN']           || '',
-  twilioWaFrom:             process.env['TWILIO_WA_FROM']              || '',
+  twilioWaFrom:             process.env['TWILIO_WHATSAPP_FROM']              || 'whatsapp:+12362332112',
 };
 
 server.tool(
   'run_daily_digest',
-  'Run the CarboNet daily revenue digest. Queries live Supabase data and sends formatted reports to Slack (#orders-glide) and Outlook email recipients.',
+  'Run the Acme Corp daily revenue digest. Queries live Supabase data and sends formatted reports to Slack (#orders-glide) and Outlook email recipients.',
   {
     dry_run: z.boolean().default(false).describe('If true, returns the formatted messages without sending them'),
     channels: z.array(z.enum(['slack', 'email', 'whatsapp'])).default(['slack', 'email']).describe('Which channels to send to'),

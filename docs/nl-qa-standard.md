@@ -1,8 +1,8 @@
-# CarboNet NL Q&A Pattern Standard
+# Acme Corp NL Q&A Pattern Standard
 
 ## Purpose
 
-This rule establishes the mandatory architecture for any new data domain added to CarboNet's analytical infrastructure. Every new data source must follow this pattern to ensure consistency, maintainability, and self-improvement via automated evaluation.
+This rule establishes the mandatory architecture for any new data domain added to Acme Corp's analytical infrastructure. Every new data source must follow this pattern to ensure consistency, maintainability, and self-improvement via automated evaluation.
 
 ## Standard Components (All Required)
 

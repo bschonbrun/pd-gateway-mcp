@@ -229,7 +229,7 @@ Pipedream has native Glide actions. Use `pd_run_action` with any `glide-*` actio
 ### Installation
 
 ```bash
-git clone https://github.com/bschonbrun/pd-gateway-mcp.git
+git clone https://github.com/your-username/pd-gateway-mcp.git
 cd pd-gateway-mcp
 npm install
 npm run build

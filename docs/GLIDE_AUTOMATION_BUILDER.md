@@ -4,7 +4,7 @@
 
 A Glide app that lets non-technical users configure and deploy Pipedream automations through a friendly UI. Glide is the abstraction layer; Pipedream is the execution engine. Users never see Pipedream.
 
-**Phase 1**: Internal — CarboNet team configures workflows against enterprise tools (HubSpot, Slack, Sheets, Supabase)
+**Phase 1**: Internal — Acme Corp team configures workflows against enterprise tools (HubSpot, Slack, Sheets, Supabase)
 **Phase 2**: Platform — Offer to other Glide users as a template/product. Each customer connects their own tools.
 
 ---
@@ -178,7 +178,7 @@ Each proxy endpoint is a **single Pipedream workflow** with:
 
 ## Phased Implementation
 
-### Phase 1: Internal MVP (CarboNet)
+### Phase 1: Internal MVP (Acme Corp)
 
 > [!IMPORTANT]
 > **Goal**: Team deploys automations against pre-connected enterprise tools.
@@ -235,7 +235,7 @@ Each proxy endpoint is a **single Pipedream workflow** with:
 
 ## What Makes This Compelling
 
-1. **For CarboNet**: Your team gets a dead-simple way to configure automations without learning Pipedream
+1. **For Acme Corp**: Your team gets a dead-simple way to configure automations without learning Pipedream
 2. **For Glide users**: A template they can install to turn their Glide app into an automation platform
 3. **As a product**: Nobody has built "Zapier inside Glide" — this is the first visual automation builder that uses Glide as the UI and Pipedream as the engine
 4. **Moat**: The proxy layer + Glide template is hard to replicate. It combines two platforms in a way neither offers alone.

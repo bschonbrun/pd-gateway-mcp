@@ -137,7 +137,7 @@ function renderDigestCard(d: DigestData): string {
   <div style="margin-bottom:24px;">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
       <div style="width:32px;height:32px;background:linear-gradient(135deg,#14b8a6,#0d9488);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;">📊</div>
-      <span style="font-size:20px;font-weight:700;letter-spacing:-0.5px;">CarboNet Revenue</span>
+      <span style="font-size:20px;font-weight:700;letter-spacing:-0.5px;">Acme Corp Revenue</span>
     </div>
     <div style="font-size:14px;color:#64748b;margin-left:42px;">${formatDate(d.report_date)}</div>
   </div>
@@ -209,7 +209,7 @@ function renderDigestCard(d: DigestData): string {
 
   <!-- Footer -->
   <div style="text-align:center;padding-top:8px;">
-    <span style="font-size:11px;color:#475569;">Generated ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Vancouver' })} PT · CarboNet BillSuite</span>
+    <span style="font-size:11px;color:#475569;">Generated ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Vancouver' })} PT · Acme Corp BillSuite</span>
   </div>
 
 </div>

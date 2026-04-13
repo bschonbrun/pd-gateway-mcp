@@ -1,4 +1,4 @@
-// CarboNet Financial Intelligence — expense-query edge function v11
+// Acme Corp Financial Intelligence — expense-query edge function v11
 // Sources: Expensify + Float Financial + Xero (AP, AR, GL, Bank, Credit Notes, COA)
 // v11: Added feedback loop — /wrong, /learn, reactions, log_id tracking
 
@@ -10,7 +10,7 @@ const HELP_PATTERNS = /^\s*(\/(help|\?))\s*$/i;
 
 const FEEDBACK_PATTERNS = /^\s*\/(wrong|learn)\s/i;
 
-const DATA_SUMMARY = `*CarboNet Financial Intelligence — Available Data* 📊
+const DATA_SUMMARY = `*Acme Corp Financial Intelligence — Available Data* 📊
 
 We have *80,000+ records* across five financial data sources:
 
@@ -21,8 +21,8 @@ Fields: employee, merchant, team/category, card name, amount (CAD), date, GL cod
 Fields: employee, merchant, category, project tag, amount, currency, approval manager, report status, receipt URL, billable/reimbursable flags
 
 *📄 Xero AP — Accounts Payable (vendor bills)* — 26,000+ bills across 2 entities
-• *Carbonet Water Treatment - USD* — the *US entity*
-• *Carbonet Canada (USD)* — the *Canadian entity* (also in USD)
+• *Acme Water Treatment - USD* — the *US entity*
+• *Acme Canada (USD)* — the *Canadian entity* (also in USD)
 Fields: vendor, invoice #, status, dates, total, amount due/paid/credited, payment dates, PO reference, line items
 
 *🧾 Xero AR — Accounts Receivable (customer invoices)* — invoices across 2 entities
@@ -63,7 +63,7 @@ Fields: account code, name, type, class (ASSET/LIABILITY/EQUITY/INCOME/EXPENSE)
 
 const EXPENSE_SCHEMA_CONTEXT = `
 ## BUSINESS CONTEXT
-CarboNet tracks financial data from five sources:
+Acme Corp tracks financial data from five sources:
 1. FLOAT FINANCIAL: corporate card transactions (direct-pay, not reimbursable)
 2. EXPENSIFY: employee expense reports (reimbursable + billable)
 3. XERO AP: vendor invoices / Accounts Payable — two legal entities, both in USD
@@ -71,8 +71,8 @@ CarboNet tracks financial data from five sources:
 5. XERO GL: general ledger journals, bank transactions, chart of accounts, credit notes
 
 XERO ENTITIES (both denominated in USD — the USD suffix does NOT indicate country):
-- 'Carbonet Water Treatment - USD' = the US company (United States entity)
-- 'Carbonet Canada (USD)'          = the Canadian company (Canada entity, billed in USD)
+- 'Acme Water Treatment - USD' = the US company (United States entity)
+- 'Acme Canada (USD)'          = the Canadian company (Canada entity, billed in USD)
 
 ## expense_transactions — one row per transaction (Float + Expensify combined)
   id                       text PK    -- float_ prefix = Float, numeric = Expensify
@@ -98,7 +98,7 @@ XERO ENTITIES (both denominated in USD — the USD suffix does NOT indicate coun
 ## xero_bills — vendor invoices (Accounts Payable)
   id                    text PK
   xero_tenant_id        text
-  company_name          text      -- 'Carbonet Water Treatment - USD' | 'Carbonet Canada (USD)'
+  company_name          text      -- 'Acme Water Treatment - USD' | 'Acme Canada (USD)'
   invoice_number        text
   contact_name          text      -- vendor name
   status                text      -- 'DRAFT'|'AUTHORISED'|'PAID'|'VOIDED'|'DELETED'
@@ -273,13 +273,13 @@ XERO ENTITIES (both denominated in USD — the USD suffix does NOT indicate coun
 - DPO: AVG(fully_paid_on_date - invoice_date) on xero_bills WHERE status='PAID' AND fully_paid_on_date IS NOT NULL
 - Bank unreconciled: is_reconciled = false AND status = 'AUTHORISED'
 - GL debit entries: net_amount > 0, credit entries: net_amount < 0
-- XERO US ENTITY: company_name = 'Carbonet Water Treatment - USD'
-- XERO CANADA ENTITY: company_name = 'Carbonet Canada (USD)'
+- XERO US ENTITY: company_name = 'Acme Water Treatment - USD'
+- XERO CANADA ENTITY: company_name = 'Acme Canada (USD)'
 - Do NOT confuse "(USD)" in the company name with the entity being American
 - The current date is ${new Date().toISOString().split('T')[0]}
 `;
 
-const SQL_SYSTEM_PROMPT = `You are a SQL expert for CarboNet's financial database (PostgreSQL).
+const SQL_SYSTEM_PROMPT = `You are a SQL expert for Acme Corp's financial database (PostgreSQL).
 Generate a single SELECT query to answer the user's question about company finances.
 
 ${EXPENSE_SCHEMA_CONTEXT}
@@ -304,7 +304,7 @@ Rules:
 - Keep answers brief — 2-5 lines for simple queries, short list for multi-row
 - Mention the data source (Float card / Expensify / Xero AP / Xero AR / GL) when relevant
 - For employee expenses, mention the category context
-- For Xero data, always distinguish entity clearly: label 'Carbonet Water Treatment - USD' as the *US entity* and 'Carbonet Canada (USD)' as the *Canadian entity*
+- For Xero data, always distinguish entity clearly: label 'Acme Water Treatment - USD' as the *US entity* and 'Acme Canada (USD)' as the *Canadian entity*
 - For bills/invoices, mention vendor/customer name and due date where relevant
 - If results are empty, say so clearly
 - Never expose raw SQL or technical details
@@ -420,7 +420,7 @@ function buildGlossaryResponse(definitions: FinancialDefinition[]): string {
   };
 
   const totalCount = definitions.length;
-  let response = `*CarboNet Financial Intelligence — ${totalCount} Financial Terms & KPIs* 📚\n`;
+  let response = `*Acme Corp Financial Intelligence — ${totalCount} Financial Terms & KPIs* 📚\n`;
   response += `_Ask about any of these by name, or use natural language (e.g. "what's our DSO?")_\n\n`;
 
   for (const [cat, items] of Object.entries(byCategory)) {

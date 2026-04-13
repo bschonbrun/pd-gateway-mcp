@@ -50,7 +50,7 @@ function periodTag(q: { is_closed: boolean; is_current: boolean }): string {
 
 export function formatSlack(d: DigestData): string {
   const lines: string[] = [
-    `*📊 CarboNet Daily Digest — ${d.report_date}*`,
+    `*📊 Acme Corp Daily Digest — ${d.report_date}*`,
     '',
     `*━━━ YTD Summary ━━━*`,
     `Actual ${fmt(d.ytd.actual)} · Forecast ${fmt(d.ytd.forecast)} · Target ${fmt(d.ytd.target)}`,
@@ -133,11 +133,11 @@ export function formatSlack(d: DigestData): string {
 
 function htmlTable(headers: string[], rows: string[][], opts?: { rightAlign?: number[]; highlightRows?: number[] }): string {
   const th = (h: string, i: number) =>
-    `<th style="padding:8px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #ddd;background:#f2f2f2">${h}</th>`;
+    `<th style="padding:8px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #dddddd;background:#f2f2f2">${h}</th>`;
   const td = (v: string, i: number, ri: number) => {
     const isCurrent = opts?.highlightRows?.includes(ri);
     const bg = isCurrent ? 'background:#e8f4fd;font-weight:600;' : (ri % 2 === 1 ? 'background:#f9f9f9' : '');
-    return `<td style="padding:6px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #ddd;${bg}">${v}</td>`;
+    return `<td style="padding:6px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #dddddd;${bg}">${v}</td>`;
   };
   return `<table style="border-collapse:collapse;font-size:13px;width:100%;margin-bottom:16px">
 <tr>${headers.map(th).join('')}</tr>
@@ -176,13 +176,13 @@ export function formatEmail(d: DigestData): string {
 
   const productTable = d.top_products?.length ? `<h3 style="margin:16px 0 8px">Top 5 Products MTD</h3>` + htmlTable(
     ['Product', 'Type', 'Forecast', 'Actual', 'Gap'],
-    d.top_products.map(p => [p.product, p.product_type, fmt(p.forecast), p.actual ? fmt(p.actual) : '—', `<span style="color:${p.gap < 0 ? '#c00' : '#080'}">${fmtGap(p.gap)}</span>`]),
+    d.top_products.map(p => [p.product, p.product_type, fmt(p.forecast), p.actual ? fmt(p.actual) : '—', `<span style="color:${p.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(p.gap)}</span>`]),
     { rightAlign: [2, 3, 4] },
   ) : '';
 
   const gapTable = d.forecast_gaps?.length ? `<h3 style="margin:16px 0 8px">Top 5 Forecast Gaps MTD</h3>` + htmlTable(
     ['Customer', 'Forecast', 'Actual', 'Gap'],
-    d.forecast_gaps.map(g => [g.name, fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#c00' : '#080'}">${fmtGap(g.gap)}</span>`]),
+    d.forecast_gaps.map(g => [g.name, fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(g.gap)}</span>`]),
     { rightAlign: [1, 2, 3] },
   ) : '';
 
@@ -196,7 +196,7 @@ export function formatEmail(d: DigestData): string {
   if (d.comparisons) {
     const c = d.comparisons;
     const yrs = c.years; // [2026, 2025, 2024, 2023]
-    const yoyCell = (val: number, prev: number) => `${fmt(val)} <span style="color:${val >= prev ? '#080' : '#c00'}">${pctDelta(val, prev)}</span>`;
+    const yoyCell = (val: number, prev: number) => `${fmt(val)} <span style="color:${val >= prev ? '#008800' : '#cc0000'}">${pctDelta(val, prev)}</span>`;
     const cagrCell = (latest: number, earliest: number) => `<span style="font-weight:600">${cagr(latest, earliest, 3)}</span>`;
     const m = c.mtd;
     const rows: string[][] = [
@@ -215,14 +215,18 @@ export function formatEmail(d: DigestData): string {
     );
   }
 
-  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1a1a1a">
-<h2 style="margin-bottom:4px">📊 CarboNet Daily Digest</h2>
-<p style="color:#666;margin-top:0">${d.report_date}</p>
+  return `<html>
+<body>
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1a1a1a">
+<h2 style="margin-bottom:4px">📊 Acme Corp Daily Digest</h2>
+<p style="color:#666666;margin-top:0">${d.report_date}</p>
 <h3 style="margin:16px 0 8px">YTD Summary</h3>${ytdTable}
 <h3 style="margin:16px 0 8px">Quarterly Performance</h3>${qTable}
 <h3 style="margin:16px 0 8px">Monthly Performance</h3>${mTable}
 ${yoyTable}${custTable}${productTable}${gapTable}${ordersTable}
-</div>`;
+</div>
+</body>
+</html>`;
 }
 
 export function formatWhatsApp(d: DigestData): string {

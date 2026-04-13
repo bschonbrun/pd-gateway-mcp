@@ -146,7 +146,7 @@ function formatYoYEmail(c: Comparisons): string {
 
 function formatSlack(d: DigestData): string {
   const lines: string[] = [
-    `*📊 CarboNet Daily Digest — ${d.report_date}*`, '',
+    `*📊 Acme Corp Daily Digest — ${d.report_date}*`, '',
     `*━━━ YTD Summary ━━━*`,
     `Actual ${fmt(d.ytd.actual)} · Forecast ${fmt(d.ytd.forecast)} · Target ${fmt(d.ytd.target)}`,
     '', `*━━━ Quarterly ━━━*`, '```',
@@ -195,9 +195,9 @@ function formatEmail(d: DigestData): string {
   const mTable = htmlTable(['Month', 'Target', 'Forecast', 'Actual', 'Orders', 'Totes'], d.months.map(m => [m.label + periodTag(m), fmt(m.target), fmt(m.forecast), m.actual ? fmt(m.actual) : '—', m.orders ? String(m.orders) : '—', m.totes ? String(m.totes) : '—']), { rightAlign: ra, highlightRows: mHighlight });
   const custTable = d.top_customers?.length ? `<h3 style="margin:16px 0 8px">Top 5 Customers MTD</h3>` + htmlTable(['Customer', 'Revenue', 'Orders', 'Top Product'], d.top_customers.map(c => [c.name, fmt(c.revenue), String(c.orders), c.top_product || '—']), { rightAlign: [1, 2] }) : '';
   const ordersTable = d.largest_orders?.length ? `<h3 style="margin:16px 0 8px">Top 5 Largest Orders MTD</h3>` + htmlTable(['Order #', 'Customer', 'Product', 'Revenue', 'Totes', 'Date'], d.largest_orders.map(o => [String(o.order_number), o.customer, o.product || '—', fmt(o.revenue), String(o.totes), o.order_date]), { rightAlign: [3, 4] }) : '';
-  const gapTable = d.forecast_gaps?.length ? `<h3 style="margin:16px 0 8px">Top 5 Forecast Gaps MTD</h3>` + htmlTable(['Customer', 'Forecast', 'Actual', 'Gap'], d.forecast_gaps.map(g => [g.name, fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#c00' : '#080'}">${fmtGap(g.gap)}</span>`]), { rightAlign: [1, 2, 3] }) : '';
+  const gapTable = d.forecast_gaps?.length ? `<h3 style="margin:16px 0 8px">Top 5 Forecast Gaps MTD</h3>` + htmlTable(['Customer', 'Forecast', 'Actual', 'Gap'], d.forecast_gaps.map(g => [g.name, fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(g.gap)}</span>`]), { rightAlign: [1, 2, 3] }) : '';
   const yoyTable = d.comparisons ? formatYoYEmail(d.comparisons) : '';
-  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1a1a1a">\n<h2 style="margin-bottom:4px">📊 CarboNet Daily Digest</h2>\n<p style="color:#666;margin-top:0">${d.report_date}</p>\n<h3 style="margin:16px 0 8px">YTD Summary</h3>${htmlTable(['Metric', 'Value'], [['Actual', fmt(d.ytd.actual)], ['Forecast', fmt(d.ytd.forecast)], ['Target', fmt(d.ytd.target)]], { rightAlign: [1] })}\n<h3 style="margin:16px 0 8px">Quarterly Performance</h3>${qTable}\n<h3 style="margin:16px 0 8px">Monthly Performance</h3>${mTable}\n${yoyTable}${custTable}${gapTable}${ordersTable}\n</div>`;
+  return `<div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1a1a1a">\n<h2 style="margin-bottom:4px">📊 Acme Corp Daily Digest</h2>\n<p style="color:#666;margin-top:0">${d.report_date}</p>\n<h3 style="margin:16px 0 8px">YTD Summary</h3>${htmlTable(['Metric', 'Value'], [['Actual', fmt(d.ytd.actual)], ['Forecast', fmt(d.ytd.forecast)], ['Target', fmt(d.ytd.target)]], { rightAlign: [1] })}\n<h3 style="margin:16px 0 8px">Quarterly Performance</h3>${qTable}\n<h3 style="margin:16px 0 8px">Monthly Performance</h3>${mTable}\n${yoyTable}${custTable}${gapTable}${ordersTable}\n</div>`;
 }
 
 function formatWhatsApp(d: DigestData): string {
@@ -411,13 +411,13 @@ Deno.serve(async (req: Request) => {
   const outlookProvisionId = Deno.env.get('OUTLOOK_AUTH_PROVISION_ID') ?? 'apn_xOhV44q';
   const twilioSid = Deno.env.get('TWILIO_ACCOUNT_SID')!;
   const twilioToken = Deno.env.get('TWILIO_AUTH_TOKEN')!;
-  const twilioFrom = Deno.env.get('TWILIO_WHATSAPP_FROM')!;
+  const twilioFrom = Deno.env.get('TWILIO_WHATSAPP_FROM') ?? 'whatsapp:+12362332112';
   const screenshotoneKey = Deno.env.get('SCREENSHOTONE_ACCESS_KEY') ?? '';
 
   // Overrides
   const ov = body.overrides ?? {};
   const channels = ov.channels ?? ['slack', 'email'];
-  const emailRecipients = ov.email_recipients ?? ['barry@carbonet.com', 'lindsay@carbonet.com', 'jack@carbonet.com', 'amielle@carbonet.com', 'buster@carbonet.com', 'mike@carbonet.com', 'paul@carbonet.com', 'nolan@carbonet.com', 'bill@carbonet.com', 'graeme@carbonet.com'];
+  const emailRecipients = ov.email_recipients ?? ['user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com', 'user@acme.com'];
   const whatsappRecipients = ov.whatsapp_recipients ?? ['+16047830407', '+18322365947', '+16047542885', '+16042182889', '+16043393559', '+18067909495'];
   const slackChannelId = ov.slack_channel_id ?? 'C0872NV9H43';
   const slackBotName = ov.slack_bot_name ?? 'BillSuite';

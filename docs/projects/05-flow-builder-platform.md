@@ -165,7 +165,7 @@ CREATE TABLE flow_instances (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   flow_template text NOT NULL,        -- 'daily-revenue-digest'
   flow_version text DEFAULT '1.0.0',
-  owner text NOT NULL,                -- 'bill@carbonet.com'
+  owner text NOT NULL,                -- 'user@acme.com'
   name text,                          -- user-given name
   config jsonb NOT NULL DEFAULT '{}', -- filled-in config values
   schedule text,                      -- cron expression
@@ -194,11 +194,11 @@ Example instance:
 ```json
 {
   "flow_template": "daily-revenue-digest",
-  "owner": "bill@carbonet.com",
+  "owner": "user@acme.com",
   "name": "Morning Revenue Report",
   "config": {
     "slack_channel": "C0872NV9H43",
-    "recipients": ["barry@carbonet.com", "lindsay@carbonet.com"],
+    "recipients": ["user@acme.com", "user@acme.com"],
     "subject": "Daily Revenue Tracker"
   },
   "schedule": "0 8 * * *",
@@ -247,7 +247,7 @@ Agent:  ✅ Flow created: "Morning Revenue Report"
 
 ```
 User:   "Add Mike to the daily revenue email"
-Agent:  ✅ Added mike@carbonet.com to "Morning Revenue Report"
+Agent:  ✅ Added user@acme.com to "Morning Revenue Report"
 
 User:   "Change the subject to 'Daily Revenue Tracker'"
 Agent:  ✅ Updated subject line.

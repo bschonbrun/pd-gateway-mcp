@@ -1,11 +1,11 @@
 /**
- * CarboNet Daily Revenue Digest — Pipedream Workflow Step
+ * Acme Corp Daily Revenue Digest — Pipedream Workflow Step
  *
  * Paste this as a single "Run Node.js code" step in Pipedream.
  * Trigger: Daily schedule, cron "0 15 * * *" (8:00 AM Pacific)
  *
  * Required environment variables (set in Pipedream project settings):
- *   SUPABASE_URL       = https://iykqsdiochxtfrtmuzdr.supabase.co
+ *   SUPABASE_URL       = https://your-project.supabase.co
  *   SUPABASE_ANON_KEY  = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
  *   SLACK_BOT_TOKEN    = xoxb-... (from your Slack app or Pipedream Slack connection)
  *   SLACK_CHANNEL_ID   = C0872NV9H43
@@ -68,7 +68,7 @@ export default defineComponent({
 
     // ── 4. Slack message (mrkdwn) ────────────────────────────────────
     const slackText = [
-      `*📊 CarboNet Daily Digest — ${today}*`,
+      `*📊 Acme Corp Daily Digest — ${today}*`,
       '',
       `*MTD Performance*`,
       `Actual: ${fmtExact(mtdActual)} (${m.mtd_orders} orders)`,
@@ -102,7 +102,7 @@ export default defineComponent({
       `<td style="padding:8px 16px;text-align:right;border:1px solid #ddd">${val}</td></tr>`
     ).join('');
     const emailBody = `<div style="font-family:Arial,sans-serif;max-width:600px">
-<h2 style="color:#1a1a1a;margin-bottom:4px">📊 CarboNet Daily Digest</h2>
+<h2 style="color:#1a1a1a;margin-bottom:4px">📊 Acme Corp Daily Digest</h2>
 <p style="color:#666;margin-top:0">${today}</p>
 <table style="border-collapse:collapse;font-size:14px;width:100%">
 <tr style="background:#f2f2f2">
@@ -113,7 +113,7 @@ export default defineComponent({
 
     // ── 6. WhatsApp text ─────────────────────────────────────────────
     const whatsAppText = [
-      `📊 *CarboNet Daily Digest — ${today}*`,
+      `📊 *Acme Corp Daily Digest — ${today}*`,
       '',
       `📅 *MTD Performance*`,
       `Actual: ${fmtExact(mtdActual)} (${m.mtd_orders} orders)`,

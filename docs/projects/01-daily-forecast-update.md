@@ -43,7 +43,7 @@ Fan out in parallel:
 ## Message Format (WhatsApp / Slack)
 
 ```
-📊 *CarboNet Revenue — {date}*
+📊 *Acme Corp Revenue — {date}*
 
 MTD Actual:    ${actual}
 MTD Forecast:  ${forecast}

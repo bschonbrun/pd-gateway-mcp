@@ -61,7 +61,7 @@ pd_list_app_actions → pd_get_component → pd_configure_prop → pd_run_action
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/bschonbrun/pd-gateway-mcp.git
+git clone https://github.com/your-username/pd-gateway-mcp.git
 cd pd-gateway-mcp
 npm install
 npm run build

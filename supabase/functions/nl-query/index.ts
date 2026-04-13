@@ -2,14 +2,14 @@
 // Channel-agnostic: called by Slack workflow, WhatsApp webhook, or direct HTTP
 
 // ─── BUSINESS DOMAIN CONTEXT ─────────────────────────────────────────────────
-// CarboNet manufactures chemical treatment products (flocculants, polymers) sold
+// Acme Corp manufactures chemical treatment products (flocculants, polymers) sold
 // to oilfield services companies by the tote (264 gallons each). Revenue is
 // tracked via Sales Orders (actuals) and Forecast Orders (predictions).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SCHEMA_CONTEXT = `
 ## BUSINESS CONTEXT
-CarboNet sells chemical products (SimpleFloc, SimplePrime, etc.) to oilfield customers.
+Acme Corp sells chemical products (SimpleFloc, SimplePrime, etc.) to oilfield customers.
 Products are sold by the TOTE (1 tote = 264 gallons). Revenue = gallons × price_per_gallon.
 Customers are companies like XRI, Aureus, T-Rey, WPX, Select Energy, Renda, Aris, PTEC.
 Sites are specific delivery locations within a customer (e.g. XRI has sites: Curry, Texas Ten, Big Tree).
@@ -116,7 +116,7 @@ Reconciliation states:
 6. The current date for time calculations is ${new Date().toISOString().split('T')[0]}
 `;
 
-const SQL_SYSTEM_PROMPT = `You are a SQL expert for CarboNet's manufacturing revenue database (PostgreSQL).
+const SQL_SYSTEM_PROMPT = `You are a SQL expert for Acme Corp's manufacturing revenue database (PostgreSQL).
 Generate a single SELECT query to answer the user's question.
 
 ${SCHEMA_CONTEXT}

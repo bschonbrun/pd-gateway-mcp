@@ -24,16 +24,16 @@
       "type": "list",
       "label": "Email recipients",
       "default": [
-        "barry@carbonet.com",
-        "lindsay@carbonet.com",
-        "jack@carbonet.com",
-        "amielle@carbonet.com",
-        "buster@carbonet.com",
-        "mike@carbonet.com",
-        "paul@carbonet.com",
-        "nolan@carbonet.com",
-        "bill@carbonet.com",
-        "graeme@carbonet.com"
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com",
+        "user@acme.com"
       ]
     },
     {

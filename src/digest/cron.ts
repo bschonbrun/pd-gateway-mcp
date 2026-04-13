@@ -13,7 +13,7 @@ const config: SenderConfig = {
   slackAuthProvisionId:     process.env['SLACK_AUTH_PROVISION_ID']    || 'apn_P8hEEEa',
   outlookAuthProvisionId:   process.env['OUTLOOK_AUTH_PROVISION_ID']  || 'apn_Xeh00n7',
   slackChannelId:           process.env['SLACK_DIGEST_CHANNEL']       || 'C0872NV9H43',
-  emailRecipients:         (process.env['DIGEST_EMAIL_RECIPIENTS']    || 'barry@carbonet.com,lindsay@carbonet.com,jack@carbonet.com,amielle@carbonet.com,buster@carbonet.com,mike@carbonet.com,paul@carbonet.com,nolan@carbonet.com,bill@carbonet.com,graeme@carbonet.com').split(','),
+  emailRecipients:         (process.env['DIGEST_EMAIL_RECIPIENTS']    || 'user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com').split(','),
   emailSubjectPrefix:       process.env['DIGEST_EMAIL_SUBJECT']       || 'Daily Revenue Tracker',
   whatsappRecipients:      (process.env['DIGEST_WHATSAPP_RECIPIENTS'] || '+16047830407').split(','),
   whatsappTemplateSid:      process.env['DIGEST_TEMPLATE_SID']        || 'HX6f733603e2f8ffb785fcf131f872565a',

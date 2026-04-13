@@ -12,7 +12,7 @@
     "start": "node dist/index.js"
   },
   "keywords": ["mcp", "pipedream", "gateway", "ai", "automation"],
-  "author": "bschonbrun",
+  "author": "your-username",
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

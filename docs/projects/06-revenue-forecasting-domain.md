@@ -1,6 +1,6 @@
 # Domain: Revenue & Forecasting
 
-The first data domain for the BillSuite Core Engine. Everything CarboNet needs to manage revenue, forecasts, customer commitments, and commercial intelligence — accessible from any channel, on any device.
+The first data domain for the BillSuite Core Engine. Everything Acme Corp needs to manage revenue, forecasts, customer commitments, and commercial intelligence — accessible from any channel, on any device.
 
 ---
 
