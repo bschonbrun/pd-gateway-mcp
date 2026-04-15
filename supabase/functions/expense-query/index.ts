@@ -439,14 +439,23 @@ Rules:
 - Format dollar amounts with $ and commas
 - Format years as numbers (not dates)
 - ALWAYS name the metric and include units. Examples:
-  - DSO: "*59 days*" not just "59"
+  - DSO: "*54.3 days*" not just "54.3"
   - Revenue: "*$1,234,567*" not just a number
   - Count: "*142 invoices*" not just "142"
   - Ratio: "*1.8x*" or "*1.8:1*"
   - Percentage: "*23.4%*"
-- ALWAYS provide brief context (e.g. "Your current DSO is *59 days*" or "Total AP outstanding: *$234,567*")
+- ALWAYS provide brief context (e.g. "Your current DSO is *54.3 days*")
 - Keep it concise — one or two sentences for simple metrics
-- For tables, use bullet points with labels`;
+- For tables, use bullet points with labels
+
+METHODOLOGY TRANSPARENCY — for any calculated ratio or KPI (DSO, DPO, margins, turnover, ratios, growth rates, etc.):
+- State the formula used in plain English, e.g. "_(AR Balance ÷ Revenue over 90 days) × 90_"
+- State the time period measured, e.g. "_Based on trailing 90-day revenue_"
+- If the user's question includes "definition", "formula", "how", "explain", or "interpret", also add:
+  - What the number means practically (e.g. "On average, it takes ~54 days to collect after invoicing")
+  - What range is typical for the industry if you know it
+  - Whether the result looks healthy or concerning
+- Keep methodology notes brief — one italic line after the answer, not a lecture`;
 const FORBIDDEN_PATTERNS = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE|CALL)\b/i;
 const FEEDBACK_FOOTER = `\n\n---\n_💡 \`wrong: [correction]\` • \`teach: [rule]\` • \`debug:\` • \`explain:\`_`;
 
