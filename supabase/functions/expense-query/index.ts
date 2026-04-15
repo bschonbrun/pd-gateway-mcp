@@ -982,13 +982,13 @@ ${intentCatalog}`;
           const confirmBlocks = [
             { type: 'section', text: { type: 'mrkdwn', text: `🎓 *I think you're asking about:*\n\n> *${matchedDef.term}* — ${matchedDef.definition}` } },
             { type: 'actions', elements: [
-              { type: 'button', text: { type: 'plain_text', text: `✅ Yes, run this`, emoji: true }, style: 'primary' as const, action_id: 'intent_confirm', value: JSON.stringify({ defIdx: matchIdx, question, channelId: slack_channel, threadTs: slack_ts, engine: 'expense-query', mode }) },
-              ...altDefs.map((alt, i) => ({ type: 'button' as const, text: { type: 'plain_text' as const, text: `${alt.term}`, emoji: true }, action_id: `intent_alt_${i}`, value: JSON.stringify({ defIdx: templateDefs.indexOf(alt), question, channelId: slack_channel, threadTs: slack_ts, engine: 'expense-query', mode }) })),
-              { type: 'button', text: { type: 'plain_text', text: `❌ None — let AI figure it out`, emoji: true }, action_id: 'intent_skip', value: JSON.stringify({ question, channelId: slack_channel, threadTs: slack_ts, engine: 'expense-query', mode }) },
+              { type: 'button', text: { type: 'plain_text', text: `✅ Yes, run this`, emoji: true }, style: 'primary' as const, action_id: 'intent_confirm', value: JSON.stringify({ defIdx: matchIdx, question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) },
+              ...altDefs.map((alt, i) => ({ type: 'button' as const, text: { type: 'plain_text' as const, text: `${alt.term}`, emoji: true }, action_id: `intent_alt_${i}`, value: JSON.stringify({ defIdx: templateDefs.indexOf(alt), question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) })),
+              { type: 'button', text: { type: 'plain_text', text: `❌ None — let AI figure it out`, emoji: true }, action_id: 'intent_skip', value: JSON.stringify({ question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) },
             ] },
           ];
           await deleteSlackProgress(slack_bot_token, slack_channel);
-          await fetch('https://slack.com/api/chat.postMessage', { method: 'POST', headers: { 'Authorization': `Bearer ${slack_bot_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: slack_channel, thread_ts: slack_ts, blocks: confirmBlocks, text: `Confirm: ${matchedDef.term}?` }) });
+          await fetch('https://slack.com/api/chat.postMessage', { method: 'POST', headers: { 'Authorization': `Bearer ${slack_bot_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: slack_channel, thread_ts: slack_thread_ts, blocks: confirmBlocks, text: `Confirm: ${matchedDef.term}?` }) });
           return Response.json({ answer: `Waiting for intent confirmation: ${matchedDef.term}`, intent_pending: true, duration_ms: ms() });
         }
 
