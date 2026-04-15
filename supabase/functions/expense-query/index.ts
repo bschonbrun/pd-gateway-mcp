@@ -738,30 +738,53 @@ Deno.serve(async (req: Request) => {
     const constrainedQuestion = `${recent.question}\n\nIMPORTANT CORRECTION: A previous attempt generated incorrect SQL. The auditor found these issues:\n${meta.audit.full_text}\n\nRelevant financial definitions:\n${defsContext}\n\nYou MUST follow the definitions exactly. Generate corrected SQL.`;
 
     try {
-      const sqlResult = await callLLM(constrainedPrompt, constrainedQuestion, anthropicKey, geminiKey, 1024, true);
-      const newSql = cleanSQL(sqlResult.text);
-      if (!validateSQL(newSql).valid) return Response.json({ answer: '❌ Could not generate valid corrected SQL. Please use `wrong: [your correction]` to teach me the right approach.' });
+      // Check if a definition template can resolve this directly
+      const templateDef = relevantDefs.find(d => d.sql_template);
+      let newSql: string;
+      let usedTemplate = false;
 
-      // Re-audit the corrected SQL
+      if (templateDef?.sql_template) {
+        newSql = templateDef.sql_template;
+        usedTemplate = true;
+      } else {
+        const sqlResult = await callLLM(constrainedPrompt, constrainedQuestion, anthropicKey, geminiKey, 1024, true);
+        newSql = cleanSQL(sqlResult.text);
+        if (!validateSQL(newSql).valid) return Response.json({ answer: '❌ Could not generate valid corrected SQL. Please use `wrong: [your correction]` to teach me the right approach.' });
+      }
+
+      // Re-audit the corrected SQL (skip if using verified template)
       let reauditPassed = true;
-      if (perplexityKey && relevantDefs.length > 0) {
+      if (!usedTemplate && perplexityKey && relevantDefs.length > 0) {
         await progress('🔎 Re-auditing corrected SQL...');
         const reaudit = await auditSQLViaPerplexity(recent.question, newSql, relevantDefs, perplexityKey);
         reauditPassed = reaudit.passed || reaudit.confidence >= AUDIT_CONFIDENCE_FLOOR;
       }
 
       await progress('📊 Running corrected query...');
-      const result = await executeQuery(newSql, supabaseUrl, supabaseKey);
+      let rows: unknown[];
+      try {
+        const result = await executeQuery(newSql, supabaseUrl, supabaseKey);
+        rows = result.rows;
+      } catch (execErr) {
+        // If template failed or syntax error, retry with LLM
+        if (usedTemplate) throw execErr;
+        await progress('🔄 Retrying with error feedback...');
+        const retryResult = await callLLM(constrainedPrompt, `${constrainedQuestion}\n\nPREVIOUS ATTEMPT FAILED:\nSQL: ${newSql}\nERROR: ${execErr}\nFix the syntax error. Output ONLY valid SQL.`, anthropicKey, geminiKey, 1024, true);
+        newSql = cleanSQL(retryResult.text);
+        if (!validateSQL(newSql).valid) throw execErr;
+        const retryExec = await executeQuery(newSql, supabaseUrl, supabaseKey);
+        rows = retryExec.rows;
+      }
 
-      const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${recent.question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
+      const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${recent.question}\nResults (${rows.length}):\n${JSON.stringify((rows as unknown[]).slice(0, 50))}`, anthropicKey, geminiKey, 1024);
 
-      // Save as golden if re-audit passed
-      if (reauditPassed) {
-        await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, newSql, `Auto-resolved from audit issues: ${meta.audit.issues}`);
+      // Save as golden if using template or re-audit passed
+      if (usedTemplate || reauditPassed) {
+        await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, newSql, usedTemplate ? `Resolved via definition template: ${templateDef!.term}` : `Auto-resolved from audit issues: ${meta.audit.issues}`);
       }
 
       await deleteSlackProgress(slack_bot_token, slack_channel);
-      const statusLine = reauditPassed ? '✅ *Resolved and saved as verified answer.*' : '⚠️ *Resolved but re-audit had concerns — not saved as golden.*';
+      const statusLine = (usedTemplate || reauditPassed) ? '✅ *Resolved and saved as verified answer.*' : '⚠️ *Resolved but re-audit had concerns — not saved as golden.*';
       return Response.json({ answer: `🔧 *Resolved:* _"${recent.question}"_\n\n${fmt.text}\n\n${statusLine}\n_The corrected SQL now uses the proper formula from your definitions._` });
     } catch (e) {
       await deleteSlackProgress(slack_bot_token, slack_channel);
@@ -882,6 +905,27 @@ Deno.serve(async (req: Request) => {
       const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel });
       return Response.json({ answer, log_id: logId, sql, rows: result.rows.length, model_used: 'golden_match', golden_match: true, duration_ms: ms() });
     } catch { /* golden SQL failed — fall through to normal pipeline */ }
+  }
+
+  // ── DEFINITION TEMPLATE SHORTCUT (use verified sql_template when available)
+  const directDef = allDefinitions.find(d =>
+    d.sql_template && question.toLowerCase().includes(d.term.toLowerCase())
+  );
+  if (directDef?.sql_template && !resolution) {
+    await progress('✅ Using verified definition template...');
+    const templateSql = directDef.sql_template;
+    try {
+      const result = await executeQuery(templateSql, supabaseUrl, supabaseKey);
+      const fmtPrompt = buildFormatPromptWithFeedback(userFeedback);
+      const fmt = await callLLM(fmtPrompt, `Q: ${question}\nDefinition: ${directDef.term} — ${directDef.definition}${directDef.formula ? `\nFormula: ${directDef.formula}` : ''}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
+      let answer = (mode === 'training' ? '🎓 ' : '') + fmt.text;
+      const transparency = buildTransparency(mode, { defsUsed: [directDef], audited: false, termsResearched: [], goldenMatch: false, sql: templateSql });
+      answer += transparency.text;
+      answer += FEEDBACK_FOOTER;
+      await deleteSlackProgress(slack_bot_token, slack_channel);
+      const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
+      return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'definition_template', mode, duration_ms: ms(), transparency_meta: transparency.meta });
+    } catch { /* template SQL failed — fall through to normal pipeline */ }
   }
 
   // ── 6a. Unknown term detection (LLM-based)
