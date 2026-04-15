@@ -932,9 +932,12 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── DEFINITION TEMPLATE SHORTCUT (use verified sql_template when available)
-  const directDef = allDefinitions.find(d =>
-    d.sql_template && question.toLowerCase().includes(d.term.toLowerCase())
-  );
+  const qWords = new Set(question.toLowerCase().split(/\s+/));
+  const directDef = allDefinitions.find(d => {
+    if (!d.sql_template) return false;
+    const termWords = d.term.toLowerCase().split(/\s+/);
+    return termWords.every(w => qWords.has(w));
+  });
   if (directDef?.sql_template && !resolution) {
     await progress('✅ Using verified definition template...');
     const templateSql = directDef.sql_template;

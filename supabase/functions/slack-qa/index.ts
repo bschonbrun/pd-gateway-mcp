@@ -218,7 +218,7 @@ function buildDrilldownButtons(
 
     // Add Resolve button when audit found issues
     const auditIssues = (meta.audit as Record<string, unknown>).issues as string;
-    if (auditIssues && auditIssues !== 'none' && confPct < 70) {
+    if (auditIssues && auditIssues !== 'none' && confPct <= 80) {
       elements.push({
         type: 'button',
         text: { type: 'plain_text', text: '🔧 Resolve', emoji: true },
