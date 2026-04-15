@@ -438,34 +438,42 @@ function formatFallback(question: string, rows: unknown[]): string {
 
 function stripCitations(s: string): string { return s.replace(/\[\d+\]/g, '').replace(/\s{2,}/g, ' ').trim(); }
 
+function formatDefsList(defs: FinancialDefinition[]): string {
+  if (defs.length <= 3) return defs.map(d => `\`${d.term}\``).join(', ');
+  return `${defs.slice(0, 3).map(d => `\`${d.term}\``).join(', ')} +${defs.length - 3} more`;
+}
+
 function buildTransparency(mode: 'normal' | 'training', opts: { defsUsed: FinancialDefinition[]; audited: boolean; auditIssues?: string; auditAutoApplied?: boolean; auditConfidence?: number; termsResearched: string[]; ambiguityDetected?: boolean; ambiguityAutoSelected?: string; ambiguityConfidence?: number; goldenMatch?: boolean; sql?: string }): string {
+  const auditPct = Math.round((opts.auditConfidence ?? 0) * 100);
+  const isLowConfidenceAudit = auditPct < 50;
+
   if (mode === 'normal') {
     const parts: string[] = [];
     if (opts.goldenMatch) parts.push('✅ Verified');
-    if (opts.defsUsed.length) parts.push(`Used: ${opts.defsUsed.map(d => `"${d.term}"`).join(', ')}`);
-    if (opts.ambiguityDetected && opts.ambiguityAutoSelected) parts.push(`🤔 Interpreted as: ${opts.ambiguityAutoSelected.substring(0, 80)}`);
-    if (opts.audited) parts.push(opts.auditAutoApplied ? '🔧 Audit fix applied' : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 60)}` : '✅ Audited');
+    if (opts.defsUsed.length) parts.push(`Used: ${formatDefsList(opts.defsUsed)}`);
+    if (opts.ambiguityDetected && opts.ambiguityAutoSelected) parts.push(`🤔 ${opts.ambiguityAutoSelected.substring(0, 60)}`);
+    if (opts.audited) parts.push(opts.auditAutoApplied ? '🔧 Audit fix applied' : isLowConfidenceAudit ? `⚠️ unverified (${auditPct}%)` : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 50)}` : '✅ Audited');
     if (opts.termsResearched.length) parts.push(`🔬 ${opts.termsResearched.join(', ')}`);
     return parts.length ? `\n\n_📋 ${parts.join(' • ')}_` : '';
   }
-  // Training mode — compact bullets, no SQL dump, no full definitions
+  // Training mode — compact bullets
   const lines: string[] = [];
   if (opts.goldenMatch) lines.push('✅ Verified golden match');
-  if (opts.defsUsed.length) lines.push(`*Definitions:* ${opts.defsUsed.map(d => `\`${d.term}\``).join(', ')} (${opts.defsUsed.length} matched)`);
+  if (opts.defsUsed.length) lines.push(`*Definitions:* ${formatDefsList(opts.defsUsed)}`);
   if (opts.ambiguityDetected) {
     const label = opts.ambiguityAutoSelected
-      ? `auto-picked (${Math.round((opts.ambiguityConfidence ?? 0) * 100)}%): ${opts.ambiguityAutoSelected.substring(0, 100)}`
+      ? `auto-picked (${Math.round((opts.ambiguityConfidence ?? 0) * 100)}%): ${opts.ambiguityAutoSelected.substring(0, 80)}`
       : 'user-resolved';
     lines.push(`*Interpretation:* ${label}`);
   }
   if (opts.audited) {
-    const pct = Math.round((opts.auditConfidence ?? 0) * 100);
     const detail = opts.auditAutoApplied ? '🔧 correction applied'
-      : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 120)}`
+      : isLowConfidenceAudit ? `⚠️ unverified (${auditPct}%)`
+      : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 80)}`
       : '✅ passed';
-    lines.push(`*Audit (${pct}%):* ${detail}`);
+    lines.push(`*Audit:* ${detail}`);
   }
-  if (opts.termsResearched.length) lines.push(`*Researched:* ${opts.termsResearched.map(t => `"${t}"`).join(', ')} — saved`);
+  if (opts.termsResearched.length) lines.push(`*Researched:* ${opts.termsResearched.map(t => `"${t}"`).join(', ')}`);
   if (!lines.length) return '';
   const hint = '_Use ' + '`debug:`' + ' for SQL • ' + '`explain:`' + ' for reasoning_';
   return `\n\n📋 *How I got this:*\n${lines.map(l => `• ${l}`).join('\n')}\n${hint}`;
