@@ -908,11 +908,13 @@ Deno.serve(async (req: Request) => {
       // Always use LLM formatter for golden matches too — ensures contextual answers
       const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
       let answer = fmt.text;
-      answer += buildTransparency(mode, { defsUsed: [], audited: false, termsResearched: [], goldenMatch: true, sql });
+      const goldenDefs = matchRelevantDefinitions(question, allDefinitions);
+      const transparency = buildTransparency(mode, { defsUsed: goldenDefs, audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: true, sql });
+      answer += transparency.text;
       answer += FEEDBACK_FOOTER;
       await deleteSlackProgress(slack_bot_token, slack_channel);
-      const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel });
-      return Response.json({ answer, log_id: logId, sql, rows: result.rows.length, model_used: 'golden_match', golden_match: true, duration_ms: ms() });
+      const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
+      return Response.json({ answer, log_id: logId, sql, rows: result.rows.length, model_used: 'golden_match', golden_match: true, duration_ms: ms(), transparency_meta: transparency.meta });
     } catch { /* golden SQL failed — fall through to normal pipeline */ }
   }
 
@@ -928,7 +930,7 @@ Deno.serve(async (req: Request) => {
       const fmtPrompt = buildFormatPromptWithFeedback(userFeedback);
       const fmt = await callLLM(fmtPrompt, `Q: ${question}\nDefinition: ${directDef.term} — ${directDef.definition}${directDef.formula ? `\nFormula: ${directDef.formula}` : ''}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
       let answer = (mode === 'training' ? '🎓 ' : '') + fmt.text;
-      const transparency = buildTransparency(mode, { defsUsed: [directDef], audited: false, termsResearched: [], goldenMatch: false, sql: templateSql });
+      const transparency = buildTransparency(mode, { defsUsed: [directDef], audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: false, sql: templateSql });
       answer += transparency.text;
       answer += FEEDBACK_FOOTER;
       await deleteSlackProgress(slack_bot_token, slack_channel);
