@@ -434,8 +434,9 @@ XERO ENTITIES:
 3. NEVER invent formulas when definitions exist
 
 ## CRITICAL RULES
-- REVENUE: Use sales_orders (NOT xero_ar_invoices) for revenue queries (MTD, QTD, YTD, by customer, etc.). Filter: WHERE NOT is_draft AND NOT is_cancelled. Revenue column is "amount".
-- xero_ar_invoices is for AR/collections/DSO analysis only, NOT revenue reporting
+- REVENUE (current period — MTD, QTD): Use sales_orders. Filter: WHERE NOT is_draft AND NOT is_cancelled. Revenue column is "amount".
+- REVENUE (historical — YoY, MoM, CAGR, TTM, prior years): Use xero_ar_invoices (status IN ('AUTHORISED','PAID')). Historical invoices and sales orders should match.
+- xero_ar_invoices is the primary source for AR/collections/DSO analysis
 - xero_contacts uses "name" NOT "contact_name"
 - AP outstanding: status = 'AUTHORISED' AND amount_due > 0
 - AR outstanding: status = 'AUTHORISED' AND amount_due > 0
