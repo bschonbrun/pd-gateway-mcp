@@ -19,6 +19,9 @@ const HELP_PATTERNS = /^\s*(\/(help|\?))\s*$/i;
 const FEEDBACK_PATTERNS = /^\s*(?:\/)?(wrong|learn|teach)[:\s]\s*/i;
 const DEBUG_PATTERNS = /^\s*(?:\/)?debug:?\s*$/i;
 const EXPLAIN_PATTERNS = /^\s*(?:\/)?explain:?\s*$/i;
+const DEFINITIONS_PATTERNS = /^\s*(?:\/)?definitions?:?\s*$/i;
+const INTERPRETATION_PATTERNS = /^\s*(?:\/)?interpretation:?\s*$/i;
+const AUDIT_PATTERNS = /^\s*(?:\/)?audit:?\s*$/i;
 const TRAIN_PATTERN = /^\s*train\s*$/i;
 const TRAIN_PREFIX = /^\s*train[:\s]+\s*/i;
 const NORMAL_PATTERN = /^\s*normal\s*$/i;
@@ -434,54 +437,88 @@ function formatFallback(question: string, rows: unknown[]): string {
 
 // ─── TRANSPARENCY ───
 
-function stripCitations(s: string): string { return s.replace(/\[\d+\]/g, '').replace(/\s{2,}/g, ' ').trim(); }
-
-function formatDefsList(defs: FinancialDefinition[]): string {
-  if (defs.length <= 3) return defs.map(d => `\`${d.term}\``).join(', ');
-  return `${defs.slice(0, 3).map(d => `\`${d.term}\``).join(', ')} +${defs.length - 3} more`;
+interface TransparencyMeta {
+  definitions: { term: string; category: string; definition: string; formula: string | null }[];
+  interpretation: { method: string; confidence: number; selected: string; full_text: string } | null;
+  audit: { ran: boolean; autoApplied: boolean; confidence: number; issues: string; full_text: string } | null;
+  researched: string[];
+  golden_match: boolean;
 }
 
-function buildTransparency(mode: 'normal' | 'training', opts: { defsUsed: FinancialDefinition[]; audited: boolean; auditIssues?: string; auditAutoApplied?: boolean; auditConfidence?: number; termsResearched: string[]; ambiguityDetected?: boolean; ambiguityAutoSelected?: string; ambiguityConfidence?: number; goldenMatch?: boolean; sql?: string }): string {
+function stripCitations(s: string): string { return s.replace(/\[\d+\]/g, '').replace(/\s{2,}/g, ' ').trim(); }
+
+function smartSummarize(text: string, maxLen: number): string {
+  const clean = stripCitations(text);
+  if (clean.length <= maxLen) return clean;
+  const truncated = clean.substring(0, maxLen);
+  const lastPeriod = truncated.lastIndexOf('.');
+  const lastSemicolon = truncated.lastIndexOf(';');
+  const boundary = Math.max(lastPeriod, lastSemicolon);
+  return boundary > maxLen * 0.4 ? truncated.substring(0, boundary + 1) : truncated.replace(/\s+\S*$/, '') + '…';
+}
+
+function buildTransparency(mode: 'normal' | 'training', opts: { defsUsed: FinancialDefinition[]; audited: boolean; auditIssues?: string; auditAutoApplied?: boolean; auditConfidence?: number; termsResearched: string[]; ambiguityDetected?: boolean; ambiguityAutoSelected?: string; ambiguityConfidence?: number; goldenMatch?: boolean; sql?: string }): { text: string; meta: TransparencyMeta } {
   const auditPct = Math.round((opts.auditConfidence ?? 0) * 100);
   const isLowConfidenceAudit = auditPct < 50;
+
+  const meta: TransparencyMeta = {
+    definitions: opts.defsUsed.map(d => ({ term: d.term, category: d.category, definition: d.definition, formula: d.formula })),
+    interpretation: opts.ambiguityDetected ? {
+      method: opts.ambiguityAutoSelected ? 'auto' : 'user',
+      confidence: opts.ambiguityConfidence ?? 0,
+      selected: opts.ambiguityAutoSelected ?? '',
+      full_text: opts.ambiguityAutoSelected ?? '',
+    } : null,
+    audit: opts.audited ? {
+      ran: true,
+      autoApplied: opts.auditAutoApplied ?? false,
+      confidence: opts.auditConfidence ?? 0,
+      issues: opts.auditIssues ?? 'none',
+      full_text: stripCitations(opts.auditIssues ?? 'No issues detected.'),
+    } : null,
+    researched: opts.termsResearched,
+    golden_match: opts.goldenMatch ?? false,
+  };
 
   if (mode === 'normal') {
     const parts: string[] = [];
     if (opts.goldenMatch) parts.push('✅ Verified');
-    if (opts.defsUsed.length) parts.push(`Used: ${formatDefsList(opts.defsUsed)}`);
-    if (opts.ambiguityDetected && opts.ambiguityAutoSelected) parts.push(`🤔 ${opts.ambiguityAutoSelected.substring(0, 60)}`);
-    if (opts.audited) parts.push(opts.auditAutoApplied ? '🔧 Audit fix applied' : isLowConfidenceAudit ? `⚠️ unverified (${auditPct}%)` : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 50)}` : '✅ Audited');
+    if (opts.defsUsed.length) parts.push(`📖 ${opts.defsUsed.length} definition${opts.defsUsed.length > 1 ? 's' : ''} applied`);
+    if (opts.ambiguityDetected && opts.ambiguityAutoSelected) parts.push(`🤔 ${smartSummarize(opts.ambiguityAutoSelected, 60)}`);
+    if (opts.audited) parts.push(opts.auditAutoApplied ? '🔧 Audit fix applied' : isLowConfidenceAudit ? `⚠️ low-confidence audit (${auditPct}%)` : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${smartSummarize(opts.auditIssues, 50)}` : '✅ Audited');
     if (opts.termsResearched.length) parts.push(`🔬 ${opts.termsResearched.join(', ')}`);
-    return parts.length ? `\n\n_📋 ${parts.join(' • ')}_` : '';
+    return { text: parts.length ? `\n\n_📋 ${parts.join(' • ')}_` : '', meta };
   }
-  // Training mode — compact bullets
+
   const lines: string[] = [];
   if (opts.goldenMatch) lines.push('✅ Verified golden match');
-  if (opts.defsUsed.length) lines.push(`*Definitions:* ${formatDefsList(opts.defsUsed)}`);
+  if (opts.defsUsed.length) {
+    const defNames = opts.defsUsed.slice(0, 3).map(d => `\`${d.term}\``).join(', ');
+    const extra = opts.defsUsed.length > 3 ? ` +${opts.defsUsed.length - 3}` : '';
+    lines.push(`*Definitions:* ${defNames}${extra} (${opts.defsUsed.length} total)`);
+  }
   if (opts.ambiguityDetected) {
-    const label = opts.ambiguityAutoSelected
-      ? `auto-picked (${Math.round((opts.ambiguityConfidence ?? 0) * 100)}%): ${opts.ambiguityAutoSelected.substring(0, 80)}`
-      : 'user-resolved';
-    lines.push(`*Interpretation:* ${label}`);
+    const confStr = opts.ambiguityAutoSelected ? `auto-picked (${Math.round((opts.ambiguityConfidence ?? 0) * 100)}%)` : 'user-resolved';
+    const summary = opts.ambiguityAutoSelected ? smartSummarize(opts.ambiguityAutoSelected, 100) : '';
+    lines.push(`*Interpretation:* ${confStr}${summary ? ': ' + summary : ''}`);
   }
   if (opts.audited) {
     const detail = opts.auditAutoApplied ? '🔧 correction applied'
-      : isLowConfidenceAudit ? `⚠️ unverified (${auditPct}%)`
-      : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 80)}`
+      : isLowConfidenceAudit ? `⚠️ low confidence (${auditPct}%) — may need manual review`
+      : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${smartSummarize(opts.auditIssues, 80)}`
       : '✅ passed';
     lines.push(`*Audit:* ${detail}`);
   }
   if (opts.termsResearched.length) lines.push(`*Researched:* ${opts.termsResearched.map(t => `"${t}"`).join(', ')}`);
-  if (!lines.length) return '';
-  const hint = '_Use ' + '`debug:`' + ' for SQL • ' + '`explain:`' + ' for reasoning_';
-  return `\n\n📋 *How I got this:*\n${lines.map(l => `• ${l}`).join('\n')}\n${hint}`;
+  if (!lines.length) return { text: '', meta };
+  return { text: `\n\n📋 *How I got this:*\n${lines.map(l => `• ${l}`).join('\n')}`, meta };
 }
 
 // ─── LOGGING & FEEDBACK ───
 
 async function logQuery(url: string, key: string, entry: Record<string, unknown>): Promise<string | null> { try { const res = await fetch(`${url}/rest/v1/nl_query_log`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' }, body: JSON.stringify(entry) }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0]?.id ?? null; } catch { return null; } }
 async function writeFeedback(url: string, key: string, entry: Record<string, unknown>): Promise<boolean> { try { const res = await fetch(`${url}/rest/v1/nl_query_feedback`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify(entry) }); return res.ok; } catch { return false; } }
-async function findMostRecentLog(url: string, key: string, userId: string): Promise<{ id: string; question: string; generated_sql: string } | null> { try { const res = await fetch(`${url}/rest/v1/nl_query_log?user_id=eq.${userId}&select=id,question,generated_sql&order=created_at.desc&limit=1`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0] ?? null; } catch { return null; } }
+async function findMostRecentLog(url: string, key: string, userId: string): Promise<{ id: string; question: string; generated_sql: string; transparency_meta?: TransparencyMeta } | null> { try { const res = await fetch(`${url}/rest/v1/nl_query_log?user_id=eq.${userId}&select=id,question,generated_sql,transparency_meta&order=created_at.desc&limit=1`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0] ?? null; } catch { return null; } }
 async function saveVerifiedGolden(url: string, key: string, question: string, verifiedSql: string, notes: string): Promise<void> { try { await fetch(`${url}/rest/v1/nl_query_golden`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify({ question, correct_sql: verifiedSql, notes, approved: true, promoted: true }) }); } catch { /* best-effort */ } }
 
 // ─── MAIN HANDLER ───
@@ -566,6 +603,46 @@ Deno.serve(async (req: Request) => {
     const matched = matchRelevantDefinitions(recent.question, allDefs);
     const result = await callLLM('Explain SQL reasoning for non-technical user. 3-5 steps, Slack mrkdwn.', `Question: "${recent.question}"\nSQL: ${recent.generated_sql}\nDefinitions: ${matched.map(d => `${d.term}: ${d.definition}`).join('; ') || 'none'}`, anthropicKey, geminiKey, 512);
     return Response.json({ answer: `🧠 *Reasoning: "${recent.question}"*\n\n${result.text}` });
+  }
+
+  // ── Drill-down commands ──
+  if (DEFINITIONS_PATTERNS.test(question)) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query.' });
+    const meta = recent.transparency_meta;
+    if (!meta?.definitions?.length) {
+      const allDefs = await fetchFinancialDefinitions(supabaseUrl, supabaseKey);
+      const matched = matchRelevantDefinitions(recent.question, allDefs);
+      if (!matched.length) return Response.json({ answer: '📖 No definitions were matched for your last query.' });
+      const defLines = matched.map(d => `• *${d.term}* (${d.category})\n  ${d.definition}${d.formula ? `\n  _Formula: ${d.formula}_` : ''}`);
+      return Response.json({ answer: `📖 *Definitions for:* _"${recent.question}"_\n\n${defLines.join('\n\n')}` });
+    }
+    const defLines = meta.definitions.map(d => `• *${d.term}* (${d.category})\n  ${d.definition}${d.formula ? `\n  _Formula: ${d.formula}_` : ''}`);
+    return Response.json({ answer: `📖 *Definitions for:* _"${recent.question}"_ (${meta.definitions.length} matched)\n\n${defLines.join('\n\n')}` });
+  }
+
+  if (INTERPRETATION_PATTERNS.test(question)) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query.' });
+    const meta = recent.transparency_meta;
+    if (!meta?.interpretation) return Response.json({ answer: '🤔 No interpretation ambiguity was detected for your last query — it was interpreted directly.' });
+    const interp = meta.interpretation;
+    const confPct = Math.round(interp.confidence * 100);
+    return Response.json({ answer: `🤔 *Interpretation for:* _"${recent.question}"_\n\n• *Method:* ${interp.method === 'auto' ? 'Auto-selected' : 'User-resolved'}\n• *Confidence:* ${confPct}%\n• *Selected approach:* ${interp.selected}\n\n${interp.full_text ? `*Full reasoning:*\n${interp.full_text}` : '_No additional detail available._'}` });
+  }
+
+  if (AUDIT_PATTERNS.test(question)) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query.' });
+    const meta = recent.transparency_meta;
+    if (!meta?.audit?.ran) return Response.json({ answer: '🔬 No audit was performed on your last query.' });
+    const a = meta.audit;
+    const confPct = Math.round(a.confidence * 100);
+    const confLabel = confPct >= 80 ? 'High' : confPct >= 50 ? 'Medium' : 'Low';
+    const confExplain = confPct >= 80 ? 'The SQL closely matches the expected query pattern.'
+      : confPct >= 50 ? 'The SQL partially matches expected patterns — some aspects may need verification.'
+      : 'The SQL diverges significantly from expected patterns — manual review recommended.';
+    return Response.json({ answer: `🔬 *Audit for:* _"${recent.question}"_\n\n• *Confidence:* ${confPct}% (${confLabel})\n  _${confExplain}_\n• *Auto-correction:* ${a.autoApplied ? 'Yes — SQL was modified based on audit findings' : 'No'}\n• *Issues found:* ${a.issues === 'none' ? 'None' : a.full_text}\n\n_Type \`debug:\` to see the actual SQL, or \`wrong: [correction]\` to provide feedback._` });
   }
 
   if (FEEDBACK_PATTERNS.test(question)) {
@@ -784,10 +861,11 @@ Deno.serve(async (req: Request) => {
   const modeBadge = mode === 'training' ? '🎓 ' : '';
   answer = modeBadge + answer;
 
-  answer += buildTransparency(mode, { defsUsed: relevantDefs, audited, auditIssues, auditAutoApplied, auditConfidence, termsResearched, ambiguityDetected, ambiguityAutoSelected, ambiguityConfidence, sql: finalSql });
+  const transparency = buildTransparency(mode, { defsUsed: relevantDefs, audited, auditIssues, auditAutoApplied, auditConfidence, termsResearched, ambiguityDetected, ambiguityAutoSelected, ambiguityConfidence, sql: finalSql });
+  answer += transparency.text;
   answer += FEEDBACK_FOOTER;
 
   await deleteSlackProgress(slack_bot_token, slack_channel);
-  const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: finalSql, result_rows: rows.length, answer, duration_ms: ms(), slack_ts, slack_channel });
-  return Response.json({ answer, log_id: logId, sql: finalSql, rows: rows.length, model_used: finalModel, audited, terms_researched: termsResearched.length > 0 ? termsResearched : undefined, mode, duration_ms: ms() });
+  const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: finalSql, result_rows: rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
+  return Response.json({ answer, log_id: logId, sql: finalSql, rows: rows.length, model_used: finalModel, audited, terms_researched: termsResearched.length > 0 ? termsResearched : undefined, mode, duration_ms: ms(), transparency_meta: transparency.meta });
 });

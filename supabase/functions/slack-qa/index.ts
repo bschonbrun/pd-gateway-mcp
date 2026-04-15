@@ -154,24 +154,70 @@ function handleInteraction(payload: Record<string, unknown>): Response {
 
   const action = actions[0];
   const actionId = action.action_id as string;
-  if (!actionId.startsWith('mode_')) return jsonResponse({ text: 'Unknown action.' });
-
-  const mode = actionId === 'mode_training' ? 'training' : 'normal';
-  const { question, channelId, commandName, engine } = JSON.parse(action.value as string) as {
-    question: string; channelId: string; commandName: string; engine: Engine;
-  };
   const userId = ((payload.user as Record<string, unknown>)?.id as string) ?? 'unknown';
 
-  // Fire async
-  processAndThread(question, userId, channelId, commandName, engine, mode);
+  // Mode picker buttons
+  if (actionId.startsWith('mode_')) {
+    const mode = actionId === 'mode_training' ? 'training' : 'normal';
+    const { question, channelId, commandName, engine } = JSON.parse(action.value as string) as {
+      question: string; channelId: string; commandName: string; engine: Engine;
+    };
+    processAndThread(question, userId, channelId, commandName, engine, mode);
+    const modeLabel = mode === 'training' ? '🎓 Training' : '⚡ Normal';
+    return jsonResponse({ response_type: 'ephemeral', replace_original: true, text: `${modeLabel} mode — processing your query…` });
+  }
 
-  const modeLabel = mode === 'training' ? '🎓 Training' : '⚡ Normal';
-  // Replace the picker message with confirmation
-  return jsonResponse({
-    response_type: 'ephemeral',
-    replace_original: true,
-    text: `${modeLabel} mode — processing your query…`,
-  });
+  // Drill-down buttons (definitions, interpretation, audit)
+  if (actionId.startsWith('drilldown_')) {
+    const command = actionId.replace('drilldown_', '');
+    const { channelId, threadTs, engine } = JSON.parse(action.value as string) as {
+      channelId: string; threadTs: string; engine: Engine;
+    };
+    handleDrilldown(command, userId, channelId, threadTs, engine);
+    return jsonResponse({ response_type: 'ephemeral', text: `Loading ${command}…` });
+  }
+
+  return jsonResponse({ text: 'Unknown action.' });
+}
+
+// ─── DRILL-DOWN BUTTONS BUILDER ────────────────────────────────────────────────
+function buildDrilldownButtons(
+  channelId: string,
+  threadTs: string,
+  engine: Engine,
+  meta: Record<string, unknown> | null,
+): Record<string, unknown>[] {
+  if (!meta) return [];
+  const value = JSON.stringify({ channelId, threadTs, engine });
+  const elements: Record<string, unknown>[] = [];
+
+  if ((meta.definitions as unknown[])?.length) {
+    elements.push({
+      type: 'button',
+      text: { type: 'plain_text', text: `📖 Definitions (${(meta.definitions as unknown[]).length})`, emoji: true },
+      action_id: 'drilldown_definitions',
+      value,
+    });
+  }
+  if (meta.interpretation) {
+    elements.push({
+      type: 'button',
+      text: { type: 'plain_text', text: '🤔 Interpretation', emoji: true },
+      action_id: 'drilldown_interpretation',
+      value,
+    });
+  }
+  if ((meta.audit as Record<string, unknown>)?.ran) {
+    const confPct = Math.round(((meta.audit as Record<string, unknown>).confidence as number ?? 0) * 100);
+    elements.push({
+      type: 'button',
+      text: { type: 'plain_text', text: `🔬 Audit (${confPct}%)`, emoji: true },
+      action_id: 'drilldown_audit',
+      value,
+    });
+  }
+
+  return elements.length ? [{ type: 'actions', elements }] : [];
 }
 
 // ─── PROCESS + THREAD ──────────────────────────────────────────────────────────
@@ -181,10 +227,9 @@ async function processAndThread(
   channelId: string,
   commandName: string,
   engine: Engine,
-  mode: 'normal' | 'training'
+  mode: 'normal' | 'training',
 ): Promise<void> {
   try {
-    // 1. Post Q as parent message in channel
     const modeIcon = mode === 'training' ? '🎓' : '⚡';
     const parentRes = await slackPost('chat.postMessage', {
       channel: channelId,
@@ -198,14 +243,12 @@ async function processAndThread(
     const threadTs = (parentRes as Record<string, unknown>).ts as string;
     if (!threadTs) throw new Error('Failed to create thread — no ts returned from Slack');
 
-    // 2. Post "thinking" in thread
     await slackPost('chat.postMessage', {
       channel: channelId,
       thread_ts: threadTs,
       text: `${engine === 'nl-query' ? '💰' : '📊'} Analyzing your ${engineLabel(engine)} data…`,
     });
 
-    // 3. Call engine with full Slack context
     const res = await fetch(`${SUPABASE_URL}/functions/v1/${engine}`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json' },
@@ -225,28 +268,72 @@ async function processAndThread(
 
     const cmdDisplay = commandName !== '/ask' ? commandName : `/${engineLabel(engine)}`;
 
-    // 4. Post answer in thread
+    // Build drill-down buttons for training mode
+    const drilldownBlocks = mode === 'training'
+      ? buildDrilldownButtons(channelId, threadTs, engine, data.transparency_meta ?? null)
+      : [];
+
+    const blocks: Record<string, unknown>[] = [
+      { type: 'section', text: { type: 'mrkdwn', text: data.answer } },
+      ...drilldownBlocks,
+      { type: 'divider' },
+      {
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: `via \`${cmdDisplay}\` · ${data.rows ?? 0} row${data.rows === 1 ? '' : 's'} · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s${data.model_used ? ` · ${formatModelName(data.model_used)}` : ''}`,
+        }],
+      },
+    ];
+
     await slackPost('chat.postMessage', {
       channel: channelId,
       thread_ts: threadTs,
       text: data.answer,
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: data.answer } },
-        { type: 'divider' },
-        {
-          type: 'context',
-          elements: [{
-            type: 'mrkdwn',
-            text: `via \`${cmdDisplay}\` · ${data.rows ?? 0} row${data.rows === 1 ? '' : 's'} · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s${data.model_used ? ` · ${formatModelName(data.model_used)}` : ''}`,
-          }],
-        },
-      ],
+      blocks,
     });
   } catch (err) {
-    // Post error in channel (we may not have a thread)
     await slackPost('chat.postMessage', {
       channel: channelId,
       text: `❌ Sorry, I couldn't answer that: ${(err as Error).message}`,
+    });
+  }
+}
+
+// ─── DRILL-DOWN HANDLER ────────────────────────────────────────────────────────
+async function handleDrilldown(
+  command: string,
+  userId: string,
+  channelId: string,
+  threadTs: string,
+  engine: Engine,
+): Promise<void> {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/${engine}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question: `${command}:`,
+        user_id: userId,
+        channel: channelId,
+        mode: 'training',
+        slack_bot_token: SLACK_BOT_TOKEN,
+        slack_channel: channelId,
+        slack_thread_ts: threadTs,
+      }),
+    });
+
+    const data = await res.json();
+    await slackPost('chat.postMessage', {
+      channel: channelId,
+      thread_ts: threadTs,
+      text: data.answer ?? 'No details available.',
+    });
+  } catch (err) {
+    await slackPost('chat.postMessage', {
+      channel: channelId,
+      thread_ts: threadTs,
+      text: `❌ Error loading ${command}: ${(err as Error).message}`,
     });
   }
 }
