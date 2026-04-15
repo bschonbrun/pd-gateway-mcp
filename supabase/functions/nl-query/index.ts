@@ -1,368 +1,785 @@
-// nl-query — Natural Language → SQL → Answer pipeline
-// Channel-agnostic: called by Slack workflow, WhatsApp webhook, or direct HTTP
+// nl-query v36 — compact transparency, citation stripping, debug/explain hints
+// Normal: auto-resolve >= 0.8 confidence, ask user < 0.8
+// Training: auto-resolve >= 0.2 confidence, ask user < 0.2
+// Golden example matches = 100% confidence (always auto)
 
-// ─── BUSINESS DOMAIN CONTEXT ─────────────────────────────────────────────────
-// Acme Corp manufactures chemical treatment products (flocculants, polymers) sold
-// to oilfield services companies by the tote (264 gallons each). Revenue is
-// tracked via Sales Orders (actuals) and Forecast Orders (predictions).
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── CONFIDENCE THRESHOLDS ───
 
-const SCHEMA_CONTEXT = `
-## BUSINESS CONTEXT
-Acme Corp sells chemical products (SimpleFloc, SimplePrime, etc.) to oilfield customers.
-Products are sold by the TOTE (1 tote = 264 gallons). Revenue = gallons × price_per_gallon.
-Customers are companies like XRI, Aureus, T-Rey, WPX, Select Energy, Renda, Aris, PTEC.
-Sites are specific delivery locations within a customer (e.g. XRI has sites: Curry, Texas Ten, Big Tree).
-Sales reps: Brian, Mike. Markets: Permian, Industrial, etc.
-
-## ACTUAL SALES ("sales orders" = delivered revenue)
-sales_orders table — one row per delivered order:
-  row_id          text     -- unique ID
-  order_number    int      -- human-readable order #
-  customer_name   text     -- e.g. 'XRI', 'Aureus', 'T-Rey', 'WPX', 'Select Energy', 'Renda', 'Aris', 'PTEC'
-  site_name       text     -- delivery site e.g. 'Curry', 'Wolfcamp A', 'University'
-  product_row_id  text     -- FK to forecast_products
-  order_date      timestamptz
-  delivery_date   timestamptz  -- use this for "when revenue happened" / month bucketing
-  month           text     -- e.g. 'January', 'February'
-  year            int
-  totes           numeric  -- volume in totes
-  gallons         numeric  -- volume in gallons (totes × 264)
-  amount          numeric  -- REVENUE in dollars — USE THIS for revenue queries
-  cost_per_gallon numeric
-  price_by        text     -- 'gallon' or 'lb'
-  is_draft        bool     -- draft orders not yet confirmed
-  is_cancelled    bool     -- ALWAYS filter is_cancelled = false for real revenue
-  sales_rep       text
-  ship_mode       text
-  notes           text
-  freight_charged bool
-  freight_amount  numeric
-
-## FORECAST DATA ("forecast orders" = predicted future deliveries)
-forecast_orders table — one row per predicted delivery line:
-  id                uuid
-  price_list_row_id text     -- FK to forecast_price_lists (this is how you find customer/site)
-  expected_date     date     -- predicted delivery date
-  expected_totes    numeric  -- predicted volume in totes
-  expected_gallons  numeric  -- predicted gallons (expected_totes × 264)
-  price_per_gallon  numeric  -- price for revenue calc; FORECAST REVENUE = expected_gallons × price_per_gallon
-  status            text     -- 'predicted' | 'fulfilled' | 'missed' | 'forecast_replaced'
-  is_current        bool     -- CRITICAL: TRUE = latest forecast vintage. FALSE = older/superseded version. ALWAYS filter is_current = true
-  version_date      date     -- date this forecast version was created (multiple vintages exist)
-  source            text     -- 'excel_import' | 'manual'
-
-FORECAST VERSIONING: There are 25+ forecast vintages in the DB. Only rows with is_current = true
-represent the current working forecast. All other rows are historical snapshots — exclude them
-for any current forecast query. status='forecast_replaced' rows are permanently retired.
-
-FORECAST STATUS VALUES:
-  predicted        = active forecast line, not yet delivered
-  fulfilled        = matched to a real sales order (delivery happened)
-  missed           = explicitly marked as lost/cancelled
-  forecast_replaced = retired by a newer forecast version (always exclude)
-
-## PRICING / CUSTOMER-SITE MAPPING
-forecast_price_lists table — maps customer+site+product to a price:
-  row_id          text PK
-  customer_name   text     -- matches sales_orders.customer_name and forecast_customers.name
-  site_name       text
-  cost_per_gallon numeric  -- fallback price if forecast_orders.price_per_gallon is null
-  price_by        text
-
-## REVENUE TARGETS
-forecast_targets table — monthly revenue goals:
-  id            int PK
-  year          int
-  month         int      -- 1=January, 2=February, etc.
-  target_revenue numeric  -- dollar target for that month
-
-## REFERENCE TABLES
-forecast_customers (reference, rarely needed):
-  row_id text PK, name text, market text, sub_market text, sales_person text, is_active bool
-
-forecast_sites (reference, rarely needed):
-  row_id text PK, customer_name text, name text, city text, state text, market text, is_active bool
-
-forecast_products (reference, for product type lookups):
-  row_id text PK, bom_code text, nick_name text, type text  -- type e.g. 'SimpleFloc', 'SimplePrime'
-
-## MATCH RECONCILIATION (advanced)
-match_proposals table — links sales orders to forecast orders:
-  id uuid, sales_order_id text, forecast_order_id uuid,
-  status text ('pending' | 'accepted'), confidence numeric
-
-Reconciliation states:
-  Matched  = SO ↔ FO pair accepted by a human (forecast was correct)
-  Pending  = SO ↔ FO pair proposed by engine, awaiting review
-  Upside   = SO has no matching FO (unforecasted revenue — a pleasant surprise)
-  Miss     = FO has no matching SO (forecast that didn't materialize)
-  Downside = FO explicitly marked missed/cancelled
-
-## KEY FORMULAS
-- Actual revenue:   sales_orders.amount  (already computed, just SUM it)
-- Forecast revenue: SUM(forecast_orders.expected_gallons * forecast_orders.price_per_gallon)
-- Totes to gallons: × 264
-- MTD actual:       WHERE delivery_date >= date_trunc('month', CURRENT_DATE) AND delivery_date < NOW()
-- YTD actual:       WHERE delivery_date >= date_trunc('year', CURRENT_DATE) AND delivery_date < NOW()
-- MTD forecast:     WHERE expected_date >= date_trunc('month', CURRENT_DATE) AND expected_date < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
-
-## CRITICAL RULES
-1. For ACTUAL/REAL revenue → query sales_orders WHERE is_cancelled = false
-2. For FORECAST revenue → query forecast_orders WHERE is_current = true (and optionally status != 'forecast_replaced')
-3. To get customer/site from forecast_orders → JOIN forecast_price_lists ON forecast_orders.price_list_row_id = forecast_price_lists.row_id
-4. "Sales order" / "actual order" / "revenue" / "what we sold" → sales_orders table
-5. "Forecast" / "predicted" / "expected" → forecast_orders table
-6. The current date for time calculations is ${new Date().toISOString().split('T')[0]}
-`;
-
-const SQL_SYSTEM_PROMPT = `You are a SQL expert for Acme Corp's manufacturing revenue database (PostgreSQL).
-Generate a single SELECT query to answer the user's question.
-
-${SCHEMA_CONTEXT}
-
-SQL GENERATION RULES:
-- SELECT only. Never INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or CREATE.
-- Always alias aggregates: SUM(amount) AS revenue, COUNT(*) AS order_count
-- For "this month" / "MTD": WHERE delivery_date >= date_trunc('month', CURRENT_DATE) AND delivery_date < NOW()
-- For "YTD" / "this year": WHERE delivery_date >= date_trunc('year', CURRENT_DATE) AND delivery_date < NOW()
-- For "last month": WHERE delivery_date >= date_trunc('month', CURRENT_DATE - INTERVAL '1 month') AND delivery_date < date_trunc('month', CURRENT_DATE)
-- Limit results to 20 rows max unless user specifies otherwise (use LIMIT 20)
-- Use ILIKE for fuzzy name matching on customer_name, site_name
-- ALWAYS include is_cancelled = false when querying sales_orders
-- ALWAYS include is_current = true when querying forecast_orders
-- For forecast revenue: JOIN forecast_price_lists to get customer_name/site_name
-- If comparing actual vs target: JOIN forecast_targets ON year AND month
-- If the question truly cannot be answered from these tables: CANNOT_ANSWER: <reason>
-
-Return ONLY the raw SQL query. No markdown, no code fences, no explanation.
-
-EXAMPLE QUERIES (static fallback — more injected at runtime from golden dataset):
-
-Q: What is our MTD revenue?
-A: SELECT SUM(amount) AS mtd_revenue FROM sales_orders WHERE is_cancelled = false AND delivery_date >= date_trunc('month', CURRENT_DATE) AND delivery_date < NOW()
-
-Q: Top customers by revenue this year?
-A: SELECT customer_name, SUM(amount) AS revenue, COUNT(*) AS orders FROM sales_orders WHERE is_cancelled = false AND delivery_date >= date_trunc('year', CURRENT_DATE) GROUP BY customer_name ORDER BY revenue DESC LIMIT 10`;
-
-const FORMAT_SYSTEM_PROMPT = `You format SQL query results into clear, concise Slack messages.
-
-Rules:
-- Use Slack mrkdwn: *bold*, _italic_, \`code\`
-- Format currency with $ and appropriate suffix (K for thousands, M for millions)
-- Round to reasonable precision (2 decimal places for millions, whole numbers for thousands)
-- Keep answers brief — 2-5 lines for simple queries, a short list for multi-row results
-- If comparing actual vs forecast/target, include the percentage
-- If results are empty, say so clearly and suggest the user check their query
-- Never expose raw SQL or technical details
-- Be conversational but professional`;
-
-const FORBIDDEN_PATTERNS = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE|CALL)\b/i;
-
-interface NLQueryRequest {
-  question: string;
-  user_id: string;
-  channel?: string;
+const NORMAL_THRESHOLD = 0.8;
+const TRAINING_THRESHOLD = 0.2;
+function getThreshold(mode: 'normal' | 'training'): number {
+  return mode === 'normal' ? NORMAL_THRESHOLD : TRAINING_THRESHOLD;
 }
 
-interface NLQueryResponse {
-  answer: string;
-  sql?: string;
-  rows?: number;
-  duration_ms: number;
-  error?: string;
+// ─── PATTERN MATCHERS ───
+
+const METADATA_PATTERNS = /\b(help|capabilities|schema|data sources?|what.{0,30}(data|fields?|questions?|information|available|can (i|you|we)|have|know|track)|what('s| is) available)\b/i;
+const GLOSSARY_PATTERNS = /\b(financial (terms?|definitions?|metrics?|calculations?|formulas?)|terms? (you have|available|defined|can i ask|do you (have|know|support))|definitions? (you have|available|you (know|understand|support))|glossary|kpi|kpis|what (can|can't|cannot) (you|i) (calculate|compute|measure|ask|query|answer)|what financial|what.{0,30}(metrics?|definitions?|calculations?).{0,30}(you|available|understand|know|have|like dso)|list.{0,20}(terms?|definitions?|metrics?|formulas?)|show.{0,20}(terms?|definitions?|metrics?))\b/i;
+const HELP_PATTERNS = /^\s*(\/(help|\?))\s*$/i;
+const FEEDBACK_PATTERNS = /^\s*(?:\/)?(wrong|learn|teach)[:\s]\s*/i;
+const DEBUG_PATTERNS = /^\s*(?:\/)?debug:?\s*$/i;
+const EXPLAIN_PATTERNS = /^\s*(?:\/)?explain:?\s*$/i;
+const TRAIN_PATTERN = /^\s*train\s*$/i;
+const TRAIN_PREFIX = /^\s*train[:\s]+\s*/i;
+const NORMAL_PATTERN = /^\s*normal\s*$/i;
+const NORMAL_PREFIX = /^\s*normal[:\s]+\s*/i;
+
+// ─── TYPES ───
+
+interface EngineRequest {
+  question: string; user_id: string; channel?: string; command?: string;
+  feedback_type?: 'rating' | 'wrong' | 'learn'; log_id?: string;
+  rating?: 'positive' | 'negative'; correction?: string;
+  slack_ts?: string; slack_channel?: string; thread_context?: string;
+  slack_bot_token?: string; slack_thread_ts?: string;
+  mode?: 'normal' | 'training';
+  resolution?: { option: string; clarification_type: string; options: unknown[]; context: unknown };
 }
 
-interface GoldenExample {
-  question: string;
-  correct_sql: string;
-}
+interface GoldenExample { question: string; correct_sql: string; }
+interface FinancialDefinition { term: string; category: string; definition: string; formula: string | null; sql_template: string | null; }
+interface KnowledgeTerm { term: string; standard_ref?: string; asc_code?: string; category: string; definition: string; guidance: string | null; example: string | null; }
+interface ConversationContext { question: string; sql: string; answer: string; }
+interface LLMResult { text: string; model: string; }
 
-async function fetchGoldenExamples(supabaseUrl: string, supabaseKey: string): Promise<GoldenExample[]> {
+// ─── SLACK PROGRESS ───
+
+let _progressMsgTs: string | null = null;
+
+async function updateSlackProgress(botToken: string | undefined, channel: string | undefined, threadTs: string | undefined, text: string): Promise<void> {
+  if (!botToken || !channel || !threadTs) return;
   try {
-    const res = await fetch(
-      `${supabaseUrl}/rest/v1/nl_query_golden?approved=eq.true&promoted=eq.true&select=question,correct_sql&order=created_at.asc&limit=12`,
-      { headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` } }
-    );
-    if (!res.ok) return [];
-    return await res.json();
+    if (!_progressMsgTs) {
+      const res = await fetch('https://slack.com/api/chat.postMessage', { method: 'POST', headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, thread_ts: threadTs, text }) });
+      const data = await res.json(); if (data.ok) _progressMsgTs = data.ts;
+    } else {
+      await fetch('https://slack.com/api/chat.update', { method: 'POST', headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, ts: _progressMsgTs, text }) });
+    }
+  } catch { /* best-effort */ }
+}
+
+async function deleteSlackProgress(botToken: string | undefined, channel: string | undefined): Promise<void> {
+  if (!botToken || !channel || !_progressMsgTs) return;
+  try { await fetch('https://slack.com/api/chat.delete', { method: 'POST', headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, ts: _progressMsgTs }) }); } catch { /* cleanup */ }
+  _progressMsgTs = null;
+}
+
+// ─── DATA FETCHERS ───
+
+async function dbFetch<T>(url: string, key: string, path: string): Promise<T[]> {
+  try { const res = await fetch(`${url}/rest/v1/${path}`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return []; return await res.json() as T[]; } catch { return []; }
+}
+async function fetchGoldenExamples(url: string, key: string): Promise<GoldenExample[]> {
+  return dbFetch<GoldenExample>(url, key, 'nl_query_golden?approved=eq.true&promoted=eq.true&select=question,correct_sql&order=created_at.asc');
+}
+async function fetchFinancialDefinitions(url: string, key: string): Promise<FinancialDefinition[]> {
+  return dbFetch<FinancialDefinition>(url, key, 'financial_definitions?active=eq.true&select=term,category,definition,formula,sql_template&order=category.asc,term.asc');
+}
+async function fetchKnowledgeTerms(url: string, key: string, table: 'gaap_terms' | 'ifrs_terms'): Promise<KnowledgeTerm[]> {
+  const fields = table === 'gaap_terms' ? 'term,asc_code,category,definition,guidance,example' : 'term,standard_ref,category,definition,guidance,example';
+  return dbFetch<KnowledgeTerm>(url, key, `${table}?active=eq.true&select=${fields}&order=category.asc,term.asc`);
+}
+async function fetchConversationContext(url: string, key: string, userId: string, channel: string): Promise<ConversationContext | null> {
+  try { const res = await fetch(`${url}/rest/v1/nl_query_log?user_id=eq.${encodeURIComponent(userId)}&channel=eq.${encodeURIComponent(channel)}&generated_sql=not.is.null&error=is.null&order=created_at.desc&limit=1&select=question,generated_sql,answer`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows.length ? { question: rows[0].question, sql: rows[0].generated_sql, answer: rows[0].answer } : null; } catch { return null; }
+}
+
+// ─── MODE MANAGEMENT ───
+
+async function getUserMode(url: string, key: string, userId: string): Promise<'normal' | 'training'> {
+  try {
+    const res = await fetch(`${url}/rest/v1/engine_mode?user_id=eq.${encodeURIComponent(userId)}&select=mode&limit=1`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } });
+    if (!res.ok) return 'normal';
+    const rows = await res.json();
+    return (rows?.[0]?.mode as 'normal' | 'training') ?? 'normal';
+  } catch { return 'normal'; }
+}
+
+async function setUserMode(url: string, key: string, userId: string, mode: 'normal' | 'training'): Promise<void> {
+  try {
+    await fetch(`${url}/rest/v1/engine_mode`, {
+      method: 'POST',
+      headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates' },
+      body: JSON.stringify({ user_id: userId, mode, updated_at: new Date().toISOString() }),
+    });
+  } catch { /* best-effort */ }
+}
+
+// ─── GOLDEN MATCH (100% confidence bypass) ───
+
+function findGoldenMatch(question: string, goldens: GoldenExample[]): GoldenExample | null {
+  const q = question.toLowerCase().trim().replace(/[?!.,]+$/g, '');
+  for (const g of goldens) {
+    const gq = g.question.toLowerCase().trim().replace(/[?!.,]+$/g, '');
+    if (q === gq) return g;
+  }
+  for (const g of goldens) {
+    const gq = g.question.toLowerCase().trim();
+    const words = q.split(/\s+/);
+    const gWords = gq.split(/\s+/);
+    const overlap = words.filter(w => gWords.includes(w)).length;
+    if (overlap / Math.max(words.length, gWords.length) >= 0.85) return g;
+  }
+  return null;
+}
+
+// ─── UNKNOWN TERM DETECTION (LLM-based) ───
+
+async function detectUnknownTermsViaLLM(
+  question: string,
+  knownDefs: FinancialDefinition[],
+  anthropicKey: string,
+  geminiKey: string | undefined,
+): Promise<string[]> {
+  const knownTermsLower = new Set(knownDefs.map(d => d.term.toLowerCase()));
+  const knownTermsList = knownDefs.map(d => d.term).slice(0, 50).join(', ');
+
+  const prompt = `Extract business/financial/domain-specific terms from this question that would need a precise definition to generate correct SQL. Only extract terms where the meaning could vary by company or industry — NOT generic words.
+
+Known terms we already have definitions for: ${knownTermsList}
+
+Return ONLY a JSON array of extracted terms (excluding any that match known terms above). If no special terms, return []. Example: ["raw materials", "finished goods", "overhead costs"]
+
+IMPORTANT: Include multi-word business terms like "raw materials", "cost of goods sold", "accounts receivable", "work in progress", etc. Do NOT include generic SQL words or common English.`;
+
+  try {
+    const result = await callLLM(prompt, `Question: "${question}"`, anthropicKey, geminiKey, 200);
+    const jsonMatch = result.text.match(/\[.*\]/s);
+    if (!jsonMatch) return [];
+    const terms = JSON.parse(jsonMatch[0]) as string[];
+    return terms
+      .map(t => t.toLowerCase().trim())
+      .filter(t => t.length > 1 && !knownTermsLower.has(t));
   } catch {
     return [];
   }
 }
 
-function buildPromptWithExamples(basePrompt: string, examples: GoldenExample[]): string {
-  if (!examples.length) return basePrompt;
-  const exampleBlock = examples
-    .map(e => `Q: ${e.question}\nA: ${e.correct_sql}`)
-    .join('\n\n');
-  return `${basePrompt}\n\nGOLDEN EXAMPLES (verified correct — follow these patterns closely):\n\n${exampleBlock}`;
-}
-
-async function callClaude(systemPrompt: string, userMessage: string, apiKey: string): Promise<string> {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }],
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Claude API error ${res.status}: ${body}`);
-  }
-
-  const data = await res.json();
-  return data.content[0]?.text?.trim() ?? '';
-}
-
-function cleanSQL(raw: string): string {
-  return raw.replace(/;\s*$/, '').trim();
-}
-
-function validateSQL(sql: string): { valid: boolean; reason?: string } {
-  if (!sql || sql.startsWith('CANNOT_ANSWER:')) {
-    return { valid: false, reason: sql || 'No SQL generated' };
-  }
-
-  if (FORBIDDEN_PATTERNS.test(sql)) {
-    return { valid: false, reason: 'Query contains forbidden statements' };
-  }
-
-  const normalized = sql.trim().toUpperCase();
-  if (!normalized.startsWith('SELECT') && !normalized.startsWith('WITH')) {
-    return { valid: false, reason: 'Query must start with SELECT or WITH' };
-  }
-
-  return { valid: true };
-}
-
-async function executeQuery(sql: string, supabaseUrl: string, supabaseKey: string): Promise<{ rows: unknown[]; error?: string }> {
-  const res = await fetch(`${supabaseUrl}/rest/v1/rpc/exec_readonly_sql`, {
-    method: 'POST',
-    headers: {
-      'apikey': supabaseKey,
-      'Authorization': `Bearer ${supabaseKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ query_text: sql }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Query execution failed: ${body}`);
-  }
-
-  const data = await res.json();
-  return { rows: Array.isArray(data) ? data : [data] };
-}
-
-async function logQuery(
-  supabaseUrl: string, supabaseKey: string,
-  entry: { user_id: string; channel: string; question: string; generated_sql?: string; result_rows?: number; answer?: string; duration_ms: number; error?: string }
-): Promise<void> {
+async function researchTermViaPerplexity(term: string, apiKey: string): Promise<{ definition: string; formula: string; sql_hint: string; confidence: number } | null> {
   try {
-    await fetch(`${supabaseUrl}/rest/v1/nl_query_log`, {
-      method: 'POST',
-      headers: {
-        'apikey': supabaseKey,
-        'Authorization': `Bearer ${supabaseKey}`,
-        'Content-Type': 'application/json',
-        'Prefer': 'return=minimal',
-      },
-      body: JSON.stringify(entry),
-    });
-  } catch (e) {
-    console.error('Failed to log query:', e);
-  }
+    const res = await fetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: 'You are a financial analyst defining accounting terms for a water treatment / chemical manufacturing company. Return JSON only.' }, { role: 'user', content: `Define "${term}" for a manufacturing company. Return ONLY valid JSON:\n{"definition": "one sentence", "formula": "formula or N/A", "sql_hint": "which columns", "confidence": 0.0-1.0}\n\nconfidence = how sure you are this is the standard industry definition (1.0 = textbook definition, 0.5 = could vary by company)` }], max_tokens: 300 }) });
+    if (!res.ok) return null;
+    const data = await res.json(); const text = data.choices?.[0]?.message?.content ?? '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    return { ...parsed, confidence: parsed.confidence ?? 0.7 };
+  } catch { return null; }
 }
+
+async function saveResearchedDefinition(url: string, key: string, term: string, research: { definition: string; formula: string; sql_hint: string }): Promise<void> {
+  try { await fetch(`${url}/rest/v1/financial_definitions`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify({ term, category: 'auto_researched', definition: research.definition, formula: research.formula !== 'N/A' ? research.formula : null, sql_template: null, active: true, source: 'perplexity_auto' }) }); } catch { /* best-effort */ }
+}
+
+// ─── CLARIFICATION HINT ───
+
+const REPLY_HINT = '_Reply with *A*, *B*, or *C* in this thread_';
+
+// ─── CLARIFICATION BUILDERS ───
+
+function buildTermClarification(term: string, research: { definition: string; formula: string; sql_hint: string; confidence: number }): { message: string; options: { label: string; description: string; value: string }[] } {
+  const formulaNote = research.formula !== 'N/A' ? ` (Formula: ${research.formula})` : '';
+  const confLabel = research.confidence >= 0.8 ? '🟢 high confidence' : research.confidence >= 0.5 ? '🟡 medium confidence' : '🔴 low confidence';
+  const options = [
+    { label: 'A', description: `${research.definition}${formulaNote}`, value: 'research_accept' },
+    { label: 'B', description: `Use a different column from our data (${research.sql_hint})`, value: 'use_data_column' },
+    { label: 'C', description: 'Something else — tell me your definition', value: 'custom' },
+  ];
+  const message = `🔬 *I don't recognize "${term}" in our definitions. I researched it (${confLabel}):*\n\n*A)* ${options[0].description}\n\n*B)* ${options[1].description}\n\n*C)* Something else — tell me your definition\n\n${REPLY_HINT}`;
+  return { message, options };
+}
+
+async function checkAmbiguity(question: string, anthropicKey: string, geminiKey: string | undefined): Promise<{ isAmbiguous: boolean; confidence: number; interpretations?: { label: string; description: string; value: string }[]; message?: string; autoSelected?: string }> {
+  const prompt = `You analyze financial questions for ambiguity. Given a question, determine if it has multiple valid interpretations.\n\nIf ambiguous, return JSON: {"ambiguous": true, "confidence": 0.0-1.0, "interpretations": [{"label": "A", "description": "interpretation 1"}, {"label": "B", "description": "interpretation 2"}, {"label": "C", "description": "interpretation 3"}]}\nIf clear, return: {"ambiguous": false, "confidence": 1.0}\n\nconfidence = how confident you are that interpretation A is correct (1.0 = obviously the right reading, 0.5 = genuinely could go either way)\nOnly flag as ambiguous if there are genuinely different ways to calculate the answer.`;
+  try {
+    const result = await callLLM(prompt, `Question: "${question}"`, anthropicKey, geminiKey, 300);
+    const jsonMatch = result.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { isAmbiguous: false, confidence: 1.0 };
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.ambiguous) return { isAmbiguous: false, confidence: parsed.confidence ?? 1.0 };
+    const interps = parsed.interpretations ?? [];
+    if (!interps.length) return { isAmbiguous: false, confidence: 1.0 };
+    const confidence = parsed.confidence ?? 0.5;
+    const message = `🤔 *"${question}" could mean a few things:*\n\n${interps.map((i: { label: string; description: string }) => `*${i.label})* ${i.description}`).join('\n\n')}\n\n${REPLY_HINT}`;
+    return { isAmbiguous: true, confidence, interpretations: interps.map((i: { label: string; description: string }) => ({ ...i, value: i.description })), message, autoSelected: interps[0]?.description };
+  } catch { return { isAmbiguous: false, confidence: 1.0 }; }
+}
+
+function buildAuditClarification(_question: string, issues: string, _sql: string, _correctedSql: string | undefined): { message: string; options: { label: string; description: string; value: string }[] } {
+  const options = [
+    { label: 'A', description: 'Use my original query', value: 'keep_original' },
+    { label: 'B', description: 'Use the auditor correction', value: 'use_corrected' },
+    { label: 'C', description: 'Neither — tell me the right approach', value: 'custom' },
+  ];
+  return { message: `🔎 *My auditor flagged a potential issue:*\n\n_${issues}_\n\n*A)* Keep my original approach\n*B)* Use the auditor correction\n*C)* Neither — tell me the right approach\n\n${REPLY_HINT}`, options };
+}
+
+// ─── SQL AUDITOR ───
+
+async function auditSQLViaPerplexity(question: string, sql: string, relevantDefs: FinancialDefinition[], apiKey: string): Promise<{ passed: boolean; issues: string; corrected_sql?: string; confidence: number }> {
+  const defsContext = relevantDefs.map(d => `${d.term}: ${d.definition}${d.formula ? ` (Formula: ${d.formula})` : ''}`).join('\n');
+  try {
+    const res = await fetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: 'You audit SQL queries for financial accuracy. Return ONLY valid JSON.' }, { role: 'user', content: `Question: "${question}"\n\nSQL:\n${sql}\n\nFinancial definitions:\n${defsContext || 'None'}\n\nDoes this SQL correctly answer the question? Return JSON:\n{"passed": true/false, "issues": "description or 'none'", "corrected_sql": "fixed SQL or null", "confidence": 0.0-1.0}\n\nconfidence = how confident you are the ORIGINAL SQL is correct (1.0 = perfect, 0.5 = uncertain, 0.0 = definitely wrong)` }], max_tokens: 800 }) });
+    if (!res.ok) return { passed: true, issues: 'Audit unavailable', confidence: 0.5 };
+    const data = await res.json(); const text = data.choices?.[0]?.message?.content ?? '';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { passed: true, issues: 'Could not parse audit', confidence: 0.5 };
+    const parsed = JSON.parse(jsonMatch[0]);
+    return { ...parsed, confidence: parsed.confidence ?? (parsed.passed ? 0.9 : 0.3) };
+  } catch { return { passed: true, issues: 'Audit error', confidence: 0.5 }; }
+}
+
+// ─── FINANCIAL DEFINITIONS ───
+
+function matchRelevantDefinitions(question: string, definitions: FinancialDefinition[]): FinancialDefinition[] {
+  const q = question.toLowerCase();
+  return definitions.filter(d => {
+    if (q.includes(d.term.toLowerCase())) return true;
+    return (
+      (d.category === 'ar_ap' && /\b(ar|ap|invoice|bill|receiv|payab|vendor|customer|aging|dso|dpo|overdue|collection|payment|credit note)\b/.test(q)) ||
+      (d.category === 'cash_flow' && /\b(cash|collect|payment|burn|flow)\b/.test(q)) ||
+      (d.category === 'profitability' && /\b(revenue|sales|income|profit|margin|ebitda|roe|roa|growth|ytd|mtd|qtd|run rate)\b/.test(q)) ||
+      (d.category === 'fpa' && /\b(budget|forecast|yoy|mom|ttm|rolling|variance|growth|run rate|cagr)\b/.test(q)) ||
+      (d.category === 'expense' && /\b(expense|spend|travel|meal|software|saas|compliance|reimburs|billable)\b/.test(q)) ||
+      (d.category === 'banking' && /\b(bank|reconcil|deposit|transfer|unrecon)\b/.test(q)) ||
+      (d.category === 'gl' && /\b(gl|journal|ledger|account|debit|credit|coa|chart)\b/.test(q)) ||
+      (d.category === 'liquidity' && /\b(liquid|working capital|current ratio|quick ratio|ccc|cash cycle)\b/.test(q)) ||
+      (d.category === 'solvency' && /\b(debt|leverage|equity|interest|coverage|solvenc)\b/.test(q)) ||
+      (d.category === 'working_capital' && /\b(inventory|working capital|turnover|days)\b/.test(q))
+    );
+  }).slice(0, 8);
+}
+
+function buildGlossaryResponse(definitions: FinancialDefinition[]): string {
+  const byCategory: Record<string, FinancialDefinition[]> = {};
+  for (const d of definitions) { if (!byCategory[d.category]) byCategory[d.category] = []; byCategory[d.category].push(d); }
+  const labels: Record<string, string> = { ar_ap: '📄 AP / AR', cash_flow: '💸 Cash Flow', profitability: '📈 Revenue & Profitability', fpa: '📊 FP&A', expense: '💳 Expense', banking: '🏦 Banking', gl: '📓 GL', liquidity: '💧 Liquidity', solvency: '⚖️ Solvency', working_capital: '🔄 Working Capital', auto_researched: '🧪 Auto-Researched' };
+  let out = `*Financial Intelligence — ${definitions.length} Terms & KPIs* 📚\n\n`;
+  for (const [cat, items] of Object.entries(byCategory)) { out += `*${labels[cat] ?? cat}*\n${items.map(d => `\`${d.term}\``).join(', ')}\n\n`; }
+  return out;
+}
+
+function buildKnowledgeAnswer(question: string, terms: KnowledgeTerm[], standard: 'GAAP' | 'IFRS'): string {
+  if (!terms.length) return `No ${standard} term found.`;
+  const q = question.toLowerCase();
+  const sorted = terms.map(t => ({ t, score: (q.includes(t.term.toLowerCase()) ? 10 : 0) + (t.definition.toLowerCase().split(' ').filter(w => w.length > 4 && q.includes(w)).length) })).sort((a, b) => b.score - a.score).slice(0, 3).map(x => x.t);
+  let out = `*${standard} Reference* 📖\n\n`;
+  for (const t of sorted) { const code = t.asc_code ?? t.standard_ref ?? ''; out += `*${t.term}* ${code ? `_(${code})_` : ''}\n${t.definition}\n${t.guidance ? `_Guidance:_ ${t.guidance}\n` : ''}${t.example ? `_Example:_ ${t.example}\n` : ''}\n`; }
+  return out;
+}
+
+function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[]): string {
+  let prompt = basePrompt;
+  if (relevantDefs.length > 0) {
+    const defsBlock = relevantDefs.map(d => { let e = `TERM: ${d.term} (${d.category})\nDEFINITION: ${d.definition}`; if (d.formula) e += `\nFORMULA: ${d.formula}`; if (d.sql_template) e += `\nSQL PATTERN: ${d.sql_template}`; return e; }).join('\n\n');
+    prompt += `\n\n## RELEVANT FINANCIAL DEFINITIONS — MANDATORY\n${defsBlock}`;
+  }
+  if (researchedDefs && researchedDefs.length > 0) {
+    prompt += `\n\n## NEWLY RESEARCHED TERMS\n${researchedDefs.map(d => `TERM: ${d.term}\nDEFINITION: ${d.definition}\nFORMULA: ${d.formula}`).join('\n\n')}`;
+  }
+  if (examples.length > 0) {
+    prompt += `\n\nGOLDEN EXAMPLES:\n\n${examples.map(e => `Q: ${e.question}\nA: ${e.correct_sql}`).join('\n\n')}`;
+  }
+  return prompt;
+}
+
+// ─── HELP TEXT ───
+
+const DATA_SUMMARY = `*Financial Intelligence — Available Data* 📊\n\n*💳 Float Financial* — ~5,970 corporate card records\n*📋 Expensify* — ~25,800 expense records\n*📄 Xero AP* — 26,000+ bills (2 entities)\n*🧾 Xero AR* — invoices (2 entities)\n*🏦 Banking, GL Journals, Chart of Accounts*\n\n*Commands:* \`train\` • \`normal\` • \`debug:\` • \`explain:\` • \`wrong: [correction]\` • \`teach: [rule]\``;
+
+// ─── SCHEMA ───
+
+const NL_SCHEMA_CONTEXT = `
+## BUSINESS CONTEXT
+Acme Corp financial data from five sources:
+1. FLOAT FINANCIAL: corporate cards (direct-pay)
+2. EXPENSIFY: employee expenses (reimbursable + billable)
+3. XERO AP: vendor invoices — two entities, both USD
+4. XERO AR: customer invoices — two entities, both USD
+5. XERO GL: journals, bank transactions, chart of accounts, credit notes
+
+XERO ENTITIES:
+- 'Acme Water Treatment - USD' = US
+- 'Acme Canada (USD)' = Canadian
+
+## expense_transactions
+  id text PK, source text ('float'|'expensify'), report_id text, employee_email text,
+  manager_email text, merchant text, category text, mcc_group text, tag text,
+  amount numeric, currency text, tax_amount numeric, expense_date date,
+  report_status text, reimbursable bool, billable bool, accounting_stage text,
+  spend_compliance_status text, gl_code text
+
+## xero_bills (AP)
+  id text PK, company_name text, invoice_number text, contact_id text, contact_name text,
+  status text ('DRAFT'|'AUTHORISED'|'PAID'|'VOIDED'|'DELETED'),
+  invoice_date date, due_date date, fully_paid_on_date date,
+  total numeric, amount_due numeric, amount_paid numeric, amount_credited numeric, reference text
+
+## xero_bill_line_items
+  id text PK, bill_id text FK, description text, quantity numeric, unit_amount numeric,
+  line_amount numeric, account_code text
+
+## xero_ar_invoices (AR)
+  id text PK, company_name text, invoice_number text, contact_id text, contact_name text,
+  status text, invoice_date date, due_date date, fully_paid_on_date date,
+  total numeric, amount_due numeric, amount_paid numeric, amount_credited numeric
+
+## xero_ar_line_items
+  id text PK, invoice_id text FK, description text, quantity numeric, unit_amount numeric,
+  line_amount numeric, account_code text
+
+## xero_invoice_payments
+  id text PK, invoice_id text, invoice_type text ('AR'|'AP'), company_name text,
+  date date, amount numeric, account_code text, account_name text, is_reconciled boolean
+
+## xero_journals + xero_journal_lines
+  journal_id, company_name, journal_date, source_type, net_amount, account_code, account_name, account_type
+
+## xero_bank_transactions
+  id, company_name, transaction_type ('SPEND'|'RECEIVE'), contact_name, bank_account_name, total, date, is_reconciled
+
+## xero_contacts
+  id text PK, company_name text, name text (WARNING: column is "name" NOT "contact_name"),
+  is_supplier boolean, is_customer boolean, country text
+
+## xero_accounts (chart of accounts)
+  account_id, company_name, code, name, type, class ('ASSET'|'LIABILITY'|'EQUITY'|'INCOME'|'EXPENSE')
+
+## xero_credit_notes, xero_purchase_orders, xero_budgets, xero_tracking_categories
+
+## gl_category_mappings
+  category_name text UNIQUE, account_codes text[], description text
+
+## FORMULA PRIORITY
+1. FIRST check RELEVANT FINANCIAL DEFINITIONS
+2. THEN apply company-specific rules
+3. NEVER invent formulas when definitions exist
+
+## CRITICAL RULES
+- xero_contacts uses "name" NOT "contact_name"
+- AP outstanding: status = 'AUTHORISED' AND amount_due > 0
+- AR outstanding: status = 'AUTHORISED' AND amount_due > 0
+- Overdue: due_date < CURRENT_DATE AND amount_due > 0
+- Current date: ${new Date().toISOString().split('T')[0]}
+`;
+
+const SQL_SYSTEM_PROMPT = `You are a SQL expert for Acme Corp financial database (PostgreSQL).\nGenerate a single SELECT query.\n\n${NL_SCHEMA_CONTEXT}\n\nRules: Output ONLY SQL. CANNOT_ANSWER: <reason> if impossible. Default LIMIT 20. Follow-ups: use PRIOR context.`;
+const FORMAT_SYSTEM_PROMPT = `Format SQL results into a Slack message answering the user's question.
+
+Rules:
+- Use Slack mrkdwn formatting
+- Format dollar amounts with $ and commas
+- Format years as numbers (not dates)
+- ALWAYS name the metric and include units. Examples:
+  - DSO: "*59 days*" not just "59"
+  - Revenue: "*$1,234,567*" not just a number
+  - Count: "*142 invoices*" not just "142"
+  - Ratio: "*1.8x*" or "*1.8:1*"
+  - Percentage: "*23.4%*"
+- ALWAYS provide brief context (e.g. "Your current DSO is *59 days*" or "Total AP outstanding: *$234,567*")
+- Keep it concise — one or two sentences for simple metrics
+- For tables, use bullet points with labels`;
+const FORBIDDEN_PATTERNS = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE|CALL)\b/i;
+const FEEDBACK_FOOTER = `\n\n---\n_💡 \`wrong: [correction]\` • \`teach: [rule]\` • \`debug:\` • \`explain:\`_`;
+
+// ─── LLM CHAIN ───
+
+const GEMINI_LITE = 'gemini-3.1-flash-lite-preview';
+const GEMINI_FLASH = 'gemini-2.5-flash';
+const GEMINI_PRO = 'gemini-3-flash-preview';
+const SONNET = 'claude-sonnet-4-6';
+const HAIKU = 'claude-haiku-4-5';
+
+type ModelStep = { provider: 'gemini' | 'anthropic'; model: string };
+const SIMPLE_CHAIN: ModelStep[] = [{ provider: 'gemini', model: GEMINI_LITE }, { provider: 'gemini', model: GEMINI_FLASH }, { provider: 'gemini', model: GEMINI_PRO }, { provider: 'anthropic', model: SONNET }, { provider: 'anthropic', model: HAIKU }];
+const COMPLEX_CHAIN: ModelStep[] = [{ provider: 'gemini', model: GEMINI_FLASH }, { provider: 'gemini', model: GEMINI_PRO }, { provider: 'anthropic', model: SONNET }, { provider: 'anthropic', model: HAIKU }];
+const COMPLEX_PATTERNS = /\b(compar|vs\.?|versus|percent|trend|rank|top \d|bottom \d|breakdown|by company|by month|by vendor|year.over.year|month.over.month|growth|ratio|margin|correlat|across|between|each|per\b)/i;
+function isComplexQuery(q: string): boolean { return COMPLEX_PATTERNS.test(q); }
+
+async function callGemini(sys: string, msg: string, key: string, model: string): Promise<LLMResult | null> {
+  try { const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ system_instruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: msg }] }] }) }); if (!res.ok) return null; const data = await res.json(); return { text: data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '', model }; } catch { return null; }
+}
+async function callAnthropic(sys: string, msg: string, key: string, model: string, max = 1024): Promise<LLMResult | null> {
+  try { const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model, max_tokens: max, system: sys, messages: [{ role: 'user', content: msg }] }) }); if (!res.ok) return null; const data = await res.json(); return { text: data.content[0]?.text?.trim() ?? '', model }; } catch { return null; }
+}
+async function callLLM(sys: string, msg: string, aKey: string, gKey: string | undefined, max = 1024, complex?: boolean): Promise<LLMResult> {
+  for (const { provider, model } of (complex ? COMPLEX_CHAIN : SIMPLE_CHAIN)) { if (provider === 'gemini' && !gKey) continue; const r = provider === 'gemini' ? await callGemini(sys, msg, gKey!, model) : await callAnthropic(sys, msg, aKey, model, max); if (r) return r; }
+  throw new Error('All LLM providers failed');
+}
+
+// ─── SQL HELPERS ───
+
+function cleanSQL(raw: string): string { return raw.replace(/;?\s*$/, '').replace(/^```[\s\S]*?\n/, '').replace(/\n```\s*$/, '').trim(); }
+function validateSQL(sql: string): { valid: boolean; reason?: string } { if (!sql || sql.startsWith('CANNOT_ANSWER:')) return { valid: false, reason: sql }; if (FORBIDDEN_PATTERNS.test(sql)) return { valid: false, reason: 'Forbidden' }; const n = sql.trim().toUpperCase(); if (!n.startsWith('SELECT') && !n.startsWith('WITH')) return { valid: false, reason: 'Must start with SELECT' }; return { valid: true }; }
+async function executeQuery(sql: string, url: string, key: string): Promise<{ rows: unknown[] }> { const res = await fetch(`${url}/rest/v1/rpc/exec_readonly_sql`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ query_text: sql }) }); if (!res.ok) throw new Error(`Query failed: ${await res.text()}`); const data = await res.json(); return { rows: Array.isArray(data) ? data : [data] }; }
+
+// ─── FORMATTING ───
+
+function formatValue(val: unknown): string { if (val === null || val === undefined) return '_N/A_'; if (typeof val === 'number') { if (Math.abs(val) >= 1000) return `*$${val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}*`; if (Number.isInteger(val)) return `*${val}*`; return `*${val.toFixed(2)}*`; } return `${val}`; }
+function templateSimpleAnswer(question: string, rows: unknown[]): string | null {
+  if (rows.length === 0) return `No results for: _"${question}"_`;
+  if (rows.length > 3) return null;
+  const first = rows[0] as Record<string, unknown>; const keys = Object.keys(first);
+  // Single value results (e.g. DSO=59) → always use LLM formatter for context
+  if (rows.length === 1 && keys.length === 1) return null;
+  if (rows.length === 1 && keys.length <= 4) return keys.map(k => `• *${k.replace(/_/g, ' ')}*: ${formatValue(first[k])}`).join('\n');
+  if (rows.length <= 3 && keys.length <= 5) return (rows as Record<string, unknown>[]).map(row => { const label = row[keys[0]]; const vals = keys.slice(1).map(k => `${k.replace(/_/g, ' ')}: ${formatValue(row[k])}`).join(' · '); return `• *${label}* — ${vals}`; }).join('\n');
+  return null;
+}
+function formatFallback(question: string, rows: unknown[]): string {
+  if (rows.length === 0) return `No results: _"${question}"_`;
+  const typed = rows as Record<string, unknown>[]; const keys = Object.keys(typed[0]);
+  const lines = typed.slice(0, 20).map((row, i) => `${i + 1}. ${keys.map(k => row[k] != null ? `${k.replace(/_/g, ' ')}: ${row[k]}` : '').filter(Boolean).join(' · ')}`);
+  let out = lines.join('\n'); if (rows.length > 20) out += `\n_...and ${rows.length - 20} more_`; return out;
+}
+
+// ─── TRANSPARENCY ───
+
+function stripCitations(s: string): string { return s.replace(/\[\d+\]/g, '').replace(/\s{2,}/g, ' ').trim(); }
+
+function buildTransparency(mode: 'normal' | 'training', opts: { defsUsed: FinancialDefinition[]; audited: boolean; auditIssues?: string; auditAutoApplied?: boolean; auditConfidence?: number; termsResearched: string[]; ambiguityDetected?: boolean; ambiguityAutoSelected?: string; ambiguityConfidence?: number; goldenMatch?: boolean; sql?: string }): string {
+  if (mode === 'normal') {
+    const parts: string[] = [];
+    if (opts.goldenMatch) parts.push('✅ Verified');
+    if (opts.defsUsed.length) parts.push(`Used: ${opts.defsUsed.map(d => `"${d.term}"`).join(', ')}`);
+    if (opts.ambiguityDetected && opts.ambiguityAutoSelected) parts.push(`🤔 Interpreted as: ${opts.ambiguityAutoSelected.substring(0, 80)}`);
+    if (opts.audited) parts.push(opts.auditAutoApplied ? '🔧 Audit fix applied' : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 60)}` : '✅ Audited');
+    if (opts.termsResearched.length) parts.push(`🔬 ${opts.termsResearched.join(', ')}`);
+    return parts.length ? `\n\n_📋 ${parts.join(' • ')}_` : '';
+  }
+  // Training mode — compact bullets, no SQL dump, no full definitions
+  const lines: string[] = [];
+  if (opts.goldenMatch) lines.push('✅ Verified golden match');
+  if (opts.defsUsed.length) lines.push(`*Definitions:* ${opts.defsUsed.map(d => `\`${d.term}\``).join(', ')} (${opts.defsUsed.length} matched)`);
+  if (opts.ambiguityDetected) {
+    const label = opts.ambiguityAutoSelected
+      ? `auto-picked (${Math.round((opts.ambiguityConfidence ?? 0) * 100)}%): ${opts.ambiguityAutoSelected.substring(0, 100)}`
+      : 'user-resolved';
+    lines.push(`*Interpretation:* ${label}`);
+  }
+  if (opts.audited) {
+    const pct = Math.round((opts.auditConfidence ?? 0) * 100);
+    const detail = opts.auditAutoApplied ? '🔧 correction applied'
+      : opts.auditIssues && opts.auditIssues !== 'none' ? `⚠️ ${stripCitations(opts.auditIssues).substring(0, 120)}`
+      : '✅ passed';
+    lines.push(`*Audit (${pct}%):* ${detail}`);
+  }
+  if (opts.termsResearched.length) lines.push(`*Researched:* ${opts.termsResearched.map(t => `"${t}"`).join(', ')} — saved`);
+  if (!lines.length) return '';
+  const hint = '_Use ' + '`debug:`' + ' for SQL • ' + '`explain:`' + ' for reasoning_';
+  return `\n\n📋 *How I got this:*\n${lines.map(l => `• ${l}`).join('\n')}\n${hint}`;
+}
+
+// ─── LOGGING & FEEDBACK ───
+
+async function logQuery(url: string, key: string, entry: Record<string, unknown>): Promise<string | null> { try { const res = await fetch(`${url}/rest/v1/nl_query_log`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' }, body: JSON.stringify(entry) }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0]?.id ?? null; } catch { return null; } }
+async function writeFeedback(url: string, key: string, entry: Record<string, unknown>): Promise<boolean> { try { const res = await fetch(`${url}/rest/v1/nl_query_feedback`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify(entry) }); return res.ok; } catch { return false; } }
+async function findMostRecentLog(url: string, key: string, userId: string): Promise<{ id: string; question: string; generated_sql: string } | null> { try { const res = await fetch(`${url}/rest/v1/nl_query_log?user_id=eq.${userId}&select=id,question,generated_sql&order=created_at.desc&limit=1`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0] ?? null; } catch { return null; } }
+async function saveVerifiedGolden(url: string, key: string, question: string, verifiedSql: string, notes: string): Promise<void> { try { await fetch(`${url}/rest/v1/nl_query_golden`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify({ question, correct_sql: verifiedSql, notes, approved: true, promoted: true }) }); } catch { /* best-effort */ } }
+
+// ─── MAIN HANDLER ───
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' } });
-  }
+  if (req.method === 'OPTIONS') return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' } });
+  if (req.method !== 'POST') return Response.json({ error: 'POST only' }, { status: 405 });
 
-  if (req.method !== 'POST') {
-    return Response.json({ error: 'POST only' }, { status: 405 });
-  }
-
+  _progressMsgTs = null;
   const startMs = Date.now();
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
   const anthropicKey = Deno.env.get('ANTHROPIC_API_KEY')!;
+  const geminiKey = Deno.env.get('GEMINI_API_KEY');
+  const perplexityKey = Deno.env.get('PERPLEXITY_API_KEY');
 
-  let body: NLQueryRequest;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+  let body: EngineRequest;
+  try { body = await req.json(); } catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
+
+  let { question } = body;
+  const { user_id, channel = 'unknown', command, slack_ts, slack_channel, thread_context, slack_bot_token, slack_thread_ts, resolution } = body;
+  if (!question && !body.feedback_type) return Response.json({ error: 'question or feedback_type required' }, { status: 400 });
+  if (!user_id) return Response.json({ error: 'user_id required' }, { status: 400 });
+
+  const ms = () => Date.now() - startMs;
+  const progress = (text: string) => updateSlackProgress(slack_bot_token, slack_channel, slack_thread_ts, text);
+
+  let mode: 'normal' | 'training' = body.mode ?? 'normal';
+  if (!body.mode) mode = await getUserMode(supabaseUrl, supabaseKey, user_id);
+
+  // ── 0. train / normal toggle (standalone or prefix)
+  if (TRAIN_PATTERN.test(question)) {
+    await setUserMode(supabaseUrl, supabaseKey, user_id, 'training');
+    return Response.json({ answer: `🎓 *Training mode ON.* Confidence threshold: ${TRAINING_THRESHOLD * 100}% — I'll ask for your input on most decisions to learn your preferences.\n\n_Say \`normal\` to switch back (${NORMAL_THRESHOLD * 100}% auto-resolve)._` });
+  }
+  if (NORMAL_PATTERN.test(question)) {
+    await setUserMode(supabaseUrl, supabaseKey, user_id, 'normal');
+    return Response.json({ answer: `⚡ *Normal mode.* Confidence threshold: ${NORMAL_THRESHOLD * 100}% — I auto-resolve when confident, but I'll still ask when I'm not sure.\n\n_Say \`train\` to switch to training mode (${TRAINING_THRESHOLD * 100}% threshold)._` });
   }
 
-  const { question, user_id, channel = 'slack' } = body;
-  if (!question?.trim()) {
-    return Response.json({ error: 'Missing question' }, { status: 400 });
+  // train: <question> → switch mode AND process the question
+  if (TRAIN_PREFIX.test(question)) {
+    await setUserMode(supabaseUrl, supabaseKey, user_id, 'training');
+    mode = 'training';
+    question = question.replace(TRAIN_PREFIX, '').trim();
+    if (!question) {
+      return Response.json({ answer: `🎓 *Training mode ON.* Confidence threshold: ${TRAINING_THRESHOLD * 100}%\n\n_Say \`normal\` to switch back._` });
+    }
+  }
+  if (NORMAL_PREFIX.test(question)) {
+    await setUserMode(supabaseUrl, supabaseKey, user_id, 'normal');
+    mode = 'normal';
+    question = question.replace(NORMAL_PREFIX, '').trim();
+    if (!question) {
+      return Response.json({ answer: `⚡ *Normal mode.* Confidence threshold: ${NORMAL_THRESHOLD * 100}%\n\n_Say \`train\` to switch to training mode._` });
+    }
   }
 
-  console.log(`nl-query: user=${user_id} channel=${channel} q="${question}"`);
+  const threshold = getThreshold(mode);
 
-  // Fetch promoted golden examples and build a dynamic prompt
-  const goldenExamples = await fetchGoldenExamples(supabaseUrl, supabaseKey);
-  const dynamicPrompt = buildPromptWithExamples(SQL_SYSTEM_PROMPT, goldenExamples);
-  console.log(`nl-query: injecting ${goldenExamples.length} golden examples into prompt`);
+  // ── 0b. Feedback handler
+  if (body.feedback_type) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ error: 'No recent query' }, { status: 404 });
+    await writeFeedback(supabaseUrl, supabaseKey, { log_id: recent.id, slack_user: user_id, rating: body.rating ?? 'correction', correction: body.correction ?? question, feedback_type: body.feedback_type });
+    return Response.json({ answer: 'Feedback recorded! 👍', feedback_saved: true, duration_ms: ms() });
+  }
 
-  let sql = '';
-  try {
-    // Step 1: NL → SQL (with dynamic golden few-shots)
-    const rawSql = await callClaude(dynamicPrompt, question, anthropicKey);
-    sql = cleanSQL(rawSql);
-    console.log(`nl-query: SQL="${sql.substring(0, 200)}"`);
+  if (HELP_PATTERNS.test(question)) return Response.json({ answer: DATA_SUMMARY, duration_ms: ms() });
 
-    // Step 2: Validate
-    const validation = validateSQL(sql);
-    if (!validation.valid) {
-      const cantAnswer = sql.startsWith('CANNOT_ANSWER:')
-        ? sql.replace('CANNOT_ANSWER:', '').trim()
-        : validation.reason;
+  if (DEBUG_PATTERNS.test(question)) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query to debug.' });
+    const allDefs = await fetchFinancialDefinitions(supabaseUrl, supabaseKey);
+    const matched = matchRelevantDefinitions(recent.question, allDefs);
+    return Response.json({ answer: `🔍 *Debug*\n\n*Q:* _"${recent.question}"_\n\n*SQL:*\n\`\`\`${recent.generated_sql || 'N/A'}\`\`\`\n\n*Definitions (${matched.length}):*\n${matched.length ? matched.map(d => `• *${d.term}*: ${d.definition.substring(0, 80)}`).join('\n') : '_None_'}\n\n*Mode:* ${mode} (threshold: ${threshold * 100}%)` });
+  }
+  if (EXPLAIN_PATTERNS.test(question)) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query to explain.' });
+    const allDefs = await fetchFinancialDefinitions(supabaseUrl, supabaseKey);
+    const matched = matchRelevantDefinitions(recent.question, allDefs);
+    const result = await callLLM('Explain SQL reasoning for non-technical user. 3-5 steps, Slack mrkdwn.', `Question: "${recent.question}"\nSQL: ${recent.generated_sql}\nDefinitions: ${matched.map(d => `${d.term}: ${d.definition}`).join('; ') || 'none'}`, anthropicKey, geminiKey, 512);
+    return Response.json({ answer: `🧠 *Reasoning: "${recent.question}"*\n\n${result.text}` });
+  }
 
-      const answer = `I can't answer that from the revenue database. ${cantAnswer}`;
-      await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, answer, duration_ms: Date.now() - startMs, error: validation.reason });
-      return Response.json({ answer, duration_ms: Date.now() - startMs } satisfies NLQueryResponse);
+  if (FEEDBACK_PATTERNS.test(question)) {
+    const match = question.match(/^\s*(?:\/)?(wrong|learn|teach)[:\s]\s*([\s\S]+)/i);
+    if (match) {
+      const correctionText = match[2].trim();
+      const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+      if (!recent) return Response.json({ answer: 'Ask a question first.' });
+      await progress('📝 Recording correction...');
+      await writeFeedback(supabaseUrl, supabaseKey, { log_id: recent.id, slack_user: user_id, rating: 'negative', correction: correctionText, feedback_type: match[1].toLowerCase() });
+      await progress('🔧 Generating corrected SQL...');
+      const [examples, allDefs] = await Promise.all([fetchGoldenExamples(supabaseUrl, supabaseKey), fetchFinancialDefinitions(supabaseUrl, supabaseKey)]);
+      const relevantDefs = matchRelevantDefinitions(recent.question, allDefs);
+      const diagnosisPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs);
+      let correctedAnswer = '', verifiedSql = '';
+      try {
+        const sqlResult = await callLLM(diagnosisPrompt, `Previous SQL wrong.\nQ: "${recent.question}"\nSQL: ${recent.generated_sql}\nCorrection: "${correctionText}"\nGenerate CORRECTED SQL only.`, anthropicKey, geminiKey, 1024, true);
+        const sql = cleanSQL(sqlResult.text);
+        if (validateSQL(sql).valid) { await progress('⚡ Running corrected query...'); const result = await executeQuery(sql, supabaseUrl, supabaseKey); verifiedSql = sql; const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${recent.question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 512); correctedAnswer = fmt.text; }
+      } catch { /* best-effort */ }
+      if (verifiedSql) await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, verifiedSql, `Correction: ${correctionText}`);
+      await deleteSlackProgress(slack_bot_token, slack_channel);
+      const fullAnswer = correctedAnswer ? `📝 *Correction for:* _"${recent.question}"_\nNote: _${correctionText}_\n\n---\n*Updated:*\n${correctedAnswer}\n\n_✅ Verified SQL saved._` : `📝 *Recorded:* _${correctionText}_\nApplying going forward. 🙏`;
+      await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, answer: fullAnswer, duration_ms: ms() });
+      return Response.json({ answer: fullAnswer, duration_ms: ms() });
+    }
+  }
+
+  if (METADATA_PATTERNS.test(question)) return Response.json({ answer: DATA_SUMMARY, duration_ms: ms() });
+  if (GLOSSARY_PATTERNS.test(question)) { const defs = await fetchFinancialDefinitions(supabaseUrl, supabaseKey); return Response.json({ answer: buildGlossaryResponse(defs), duration_ms: ms() }); }
+  if (command === '/gaap' || /^\s*\/gaap\s/i.test(question)) { const terms = await fetchKnowledgeTerms(supabaseUrl, supabaseKey, 'gaap_terms'); return Response.json({ answer: buildKnowledgeAnswer(question.replace(/^\/gaap\s*/i, ''), terms, 'GAAP'), duration_ms: ms() }); }
+  if (command === '/ifrs' || /^\s*\/ifrs\s/i.test(question)) { const terms = await fetchKnowledgeTerms(supabaseUrl, supabaseKey, 'ifrs_terms'); return Response.json({ answer: buildKnowledgeAnswer(question.replace(/^\/ifrs\s*/i, ''), terms, 'IFRS'), duration_ms: ms() }); }
+
+  // ── SQL QUERY MODE — CONFIDENCE-BASED PIPELINE
+  await progress('⏳ Understanding your question...');
+
+  const [examples, allDefinitions, priorContext] = await Promise.all([
+    fetchGoldenExamples(supabaseUrl, supabaseKey),
+    fetchFinancialDefinitions(supabaseUrl, supabaseKey),
+    fetchConversationContext(supabaseUrl, supabaseKey, user_id, channel),
+  ]);
+
+  // ── GOLDEN MATCH CHECK (100% confidence — skip everything)
+  const goldenMatch = findGoldenMatch(question, examples);
+  if (goldenMatch) {
+    await progress('✅ Found verified answer...');
+    const sql = goldenMatch.correct_sql;
+    try {
+      const result = await executeQuery(sql, supabaseUrl, supabaseKey);
+      // Always use LLM formatter for golden matches too — ensures contextual answers
+      const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
+      let answer = fmt.text;
+      answer += buildTransparency(mode, { defsUsed: [], audited: false, termsResearched: [], goldenMatch: true, sql });
+      answer += FEEDBACK_FOOTER;
+      await deleteSlackProgress(slack_bot_token, slack_channel);
+      const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel });
+      return Response.json({ answer, log_id: logId, sql, rows: result.rows.length, model_used: 'golden_match', golden_match: true, duration_ms: ms() });
+    } catch { /* golden SQL failed — fall through to normal pipeline */ }
+  }
+
+  // ── 6a. Unknown term detection (LLM-based)
+  await progress('🔍 Checking for unfamiliar terms...');
+  const unknownTerms = await detectUnknownTermsViaLLM(question, allDefinitions, anthropicKey, geminiKey);
+  let researchedDefs: { term: string; definition: string; formula: string }[] = [];
+  const termsResearched: string[] = [];
+
+  if (unknownTerms.length > 0 && perplexityKey) {
+    const term = unknownTerms[0];
+    await progress(`🔬 Researching "${term}"...`);
+    const research = await researchTermViaPerplexity(term, perplexityKey);
+
+    if (research) {
+      if (research.confidence < threshold && !resolution) {
+        const clarification = buildTermClarification(term, research);
+        await deleteSlackProgress(slack_bot_token, slack_channel);
+        return Response.json({
+          type: 'clarification', clarification_type: 'unknown_term',
+          message: clarification.message, options: clarification.options,
+          context: { term, research, original_question: question, confidence: research.confidence },
+          duration_ms: ms(),
+        });
+      }
+      await saveResearchedDefinition(supabaseUrl, supabaseKey, term, research);
+      termsResearched.push(term);
+      researchedDefs.push({ term, definition: research.definition, formula: research.formula });
     }
 
-    // Step 3: Execute
-    const { rows, error: execError } = await executeQuery(sql, supabaseUrl, supabaseKey);
-    if (execError) throw new Error(execError);
-
-    console.log(`nl-query: ${rows.length} rows returned`);
-
-    // Step 4: Format answer
-    const formatPrompt = `The user asked: "${question}"
-
-The SQL query returned ${rows.length} rows:
-${JSON.stringify(rows.slice(0, 20), null, 2)}
-
-Format this into a clear, concise answer for Slack.`;
-
-    const answer = await callClaude(FORMAT_SYSTEM_PROMPT, formatPrompt, anthropicKey);
-
-    const durationMs = Date.now() - startMs;
-    await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, result_rows: rows.length, answer, duration_ms: durationMs });
-
-    return Response.json({ answer, sql, rows: rows.length, duration_ms: durationMs } satisfies NLQueryResponse);
-
-  } catch (e) {
-    const errorMsg = String(e);
-    console.error('nl-query FAILED:', errorMsg);
-    const durationMs = Date.now() - startMs;
-    await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql || undefined, duration_ms: durationMs, error: errorMsg });
-    return Response.json({ answer: 'Sorry, something went wrong processing your question. Please try rephrasing it.', error: errorMsg, duration_ms: durationMs } satisfies NLQueryResponse, { status: 500 });
+    if (unknownTerms.length > 1) {
+      const results = await Promise.all(unknownTerms.slice(1, 3).map(async (t) => {
+        const r = await researchTermViaPerplexity(t, perplexityKey);
+        if (r && r.confidence >= threshold) { await saveResearchedDefinition(supabaseUrl, supabaseKey, t, r); termsResearched.push(t); return { term: t, definition: r.definition, formula: r.formula }; }
+        return null;
+      }));
+      researchedDefs = [...researchedDefs, ...results.filter(Boolean) as typeof researchedDefs];
+    }
   }
+
+  if (resolution) {
+    const ctx = resolution.context as Record<string, unknown>;
+    if (resolution.clarification_type === 'unknown_term' && resolution.option === 'A') {
+      const research = ctx.research as { definition: string; formula: string; sql_hint: string };
+      const term = ctx.term as string;
+      await saveResearchedDefinition(supabaseUrl, supabaseKey, term, research);
+      termsResearched.push(term);
+      researchedDefs.push({ term, definition: research.definition, formula: research.formula });
+    }
+  }
+
+  // ── 6b. Ambiguity detection (confidence-gated)
+  let ambiguityDetected = false;
+  let ambiguityAutoSelected: string | undefined;
+  let ambiguityConfidence = 1.0;
+
+  if (!resolution) {
+    await progress('🧠 Checking for ambiguity...');
+    const ambiguityCheck = await checkAmbiguity(question, anthropicKey, geminiKey);
+    if (ambiguityCheck.isAmbiguous && ambiguityCheck.interpretations?.length) {
+      ambiguityDetected = true;
+      ambiguityConfidence = ambiguityCheck.confidence;
+
+      if (ambiguityCheck.confidence < threshold) {
+        await deleteSlackProgress(slack_bot_token, slack_channel);
+        return Response.json({
+          type: 'clarification', clarification_type: 'ambiguous_query',
+          message: ambiguityCheck.message, options: ambiguityCheck.interpretations,
+          context: { original_question: question, confidence: ambiguityCheck.confidence },
+          duration_ms: ms(),
+        });
+      }
+      ambiguityAutoSelected = ambiguityCheck.autoSelected ?? ambiguityCheck.interpretations[0]?.description;
+    }
+  }
+
+  let enrichedQuestion: string;
+  if (resolution && resolution.clarification_type === 'ambiguous_query') {
+    const chosenOption = (resolution.options as { label: string; description: string; value: string }[])?.find(o => o.label === resolution.option);
+    enrichedQuestion = chosenOption ? `${question}\n\nCLARIFICATION: The user means: ${chosenOption.description}` : question;
+  } else if (ambiguityAutoSelected) {
+    enrichedQuestion = `${question}\n\nAUTO-INTERPRETATION (${Math.round(ambiguityConfidence * 100)}% confident): ${ambiguityAutoSelected}`;
+  } else if (priorContext) {
+    enrichedQuestion = `PRIOR:\nQ: ${priorContext.question}\nSQL: ${priorContext.sql}\nResult: ${priorContext.answer?.substring(0, 300)}\n\nFOLLOW-UP: ${question}`;
+  } else if (thread_context) {
+    enrichedQuestion = `THREAD:\n${thread_context}\n\nCURRENT: ${question}`;
+  } else {
+    enrichedQuestion = question;
+  }
+
+  const relevantDefs = matchRelevantDefinitions(thread_context ? `${thread_context} ${question}` : question, allDefinitions);
+  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs);
+
+  await progress('⚡ Generating SQL...');
+  const complex = isComplexQuery(question);
+  let sqlResult: LLMResult;
+  try { sqlResult = await callLLM(sqlPrompt, enrichedQuestion, anthropicKey, geminiKey, 1024, complex); }
+  catch (e) { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: 'Sorry, could not generate a query.', error: String(e), duration_ms: ms() }); }
+
+  let sql = cleanSQL(sqlResult.text);
+  let modelUsed = sqlResult.model;
+  const validation = validateSQL(sql);
+  if (!validation.valid) {
+    await deleteSlackProgress(slack_bot_token, slack_channel);
+    const reason = validation.reason ?? '';
+    return Response.json({ answer: reason.startsWith('CANNOT_ANSWER:') ? `I don't have that data. ${reason.replace('CANNOT_ANSWER:', '').trim()}` : 'Could not generate a valid query.', duration_ms: ms() });
+  }
+
+  // ── 6c. Audit SQL (confidence-gated)
+  let audited = false;
+  let auditIssues = 'none';
+  let auditAutoApplied = false;
+  let auditConfidence = 1.0;
+  if (perplexityKey && relevantDefs.length > 0) {
+    await progress('🔎 Auditing query...');
+    const audit = await auditSQLViaPerplexity(question, sql, relevantDefs, perplexityKey);
+    audited = true;
+    auditIssues = audit.issues;
+    auditConfidence = audit.confidence;
+
+    if (!audit.passed && audit.corrected_sql) {
+      if (audit.confidence < threshold && !resolution) {
+        const clarification = buildAuditClarification(question, audit.issues, sql, audit.corrected_sql);
+        await deleteSlackProgress(slack_bot_token, slack_channel);
+        return Response.json({
+          type: 'clarification', clarification_type: 'audit_conflict',
+          message: clarification.message, options: clarification.options,
+          context: { original_sql: sql, corrected_sql: audit.corrected_sql, issues: audit.issues, original_question: question, confidence: audit.confidence },
+          duration_ms: ms(),
+        });
+      }
+      const corrected = cleanSQL(audit.corrected_sql);
+      if (validateSQL(corrected).valid) { sql = corrected; modelUsed = `${modelUsed} (audited)`; auditAutoApplied = true; }
+    }
+  }
+
+  if (resolution?.clarification_type === 'audit_conflict') {
+    const ctx = resolution.context as Record<string, unknown>;
+    if (resolution.option === 'A') sql = ctx.original_sql as string;
+    else if (resolution.option === 'B') { sql = cleanSQL(ctx.corrected_sql as string); modelUsed = `${modelUsed} (audited)`; }
+  }
+
+  await progress('📊 Running query...');
+  let rows: unknown[], finalSql = sql, finalModel = modelUsed;
+  try { const result = await executeQuery(sql, supabaseUrl, supabaseKey); rows = result.rows; }
+  catch (firstError) {
+    await progress('🔄 Retrying...');
+    try { const retry = await callLLM(sqlPrompt, `SQL failed:\n${sql}\nERROR: ${firstError}\nFix it. Output ONLY SQL.`, anthropicKey, geminiKey, 1024, true); const retrySql = cleanSQL(retry.text); if (validateSQL(retrySql).valid) { const r = await executeQuery(retrySql, supabaseUrl, supabaseKey); rows = r.rows; finalSql = retrySql; finalModel = retry.model; } else throw firstError; }
+    catch { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: 'Problem running that query.', sql, error: String(firstError), duration_ms: ms() }); }
+  }
+
+  await progress('✅ Formatting...');
+  let answer: string;
+  const simple = templateSimpleAnswer(question, rows);
+  if (simple) answer = simple;
+  else { try { const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${question}\nResults (${rows.length}):\n${JSON.stringify(rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024); answer = fmt.text; } catch { answer = formatFallback(question, rows); } }
+
+  // Prepend mode badge
+  const modeBadge = mode === 'training' ? '🎓 ' : '';
+  answer = modeBadge + answer;
+
+  answer += buildTransparency(mode, { defsUsed: relevantDefs, audited, auditIssues, auditAutoApplied, auditConfidence, termsResearched, ambiguityDetected, ambiguityAutoSelected, ambiguityConfidence, sql: finalSql });
+  answer += FEEDBACK_FOOTER;
+
+  await deleteSlackProgress(slack_bot_token, slack_channel);
+  const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: finalSql, result_rows: rows.length, answer, duration_ms: ms(), slack_ts, slack_channel });
+  return Response.json({ answer, log_id: logId, sql: finalSql, rows: rows.length, model_used: finalModel, audited, terms_researched: termsResearched.length > 0 ? termsResearched : undefined, mode, duration_ms: ms() });
 });

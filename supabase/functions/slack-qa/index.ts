@@ -1,51 +1,58 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 // ─── CHANNEL CONFIG ────────────────────────────────────────────────────────────
-// Add channel IDs to REVENUE_CHANNELS or EXPENSE_CHANNELS env vars (comma-separated)
 const REVENUE_CHANNELS = new Set(
   (Deno.env.get('REVENUE_CHANNELS') ?? '').split(',').filter(Boolean)
 );
-const EXPENSE_CHANNELS = new Set(
+const FINANCE_CHANNELS = new Set(
   (Deno.env.get('FINANCE_CHANNELS') ?? '').split(',').filter(Boolean)
 );
-const ALL_ALLOWED_CHANNELS = new Set([...REVENUE_CHANNELS, ...EXPENSE_CHANNELS]);
+const ALL_ALLOWED_CHANNELS = new Set([...REVENUE_CHANNELS, ...FINANCE_CHANNELS]);
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
 
 // ─── COMMAND → ENGINE ROUTING ──────────────────────────────────────────────────
-// Add new commands here as new data domains are added
 type Engine = 'nl-query' | 'expense-query';
 
 const REVENUE_CMDS = new Set(['revenue', 'forecast']);
-const EXPENSE_CMDS = new Set(['expense', 'spend', 'po', 'ap', 'ar', 'bills', 'costs']);
+const FINANCE_CMDS = new Set(['finance', 'expense', 'spend', 'po', 'ap', 'ar', 'bills', 'costs']);
 
 function resolveEngine(commandName: string, channelId: string): Engine | null {
   const cmd = commandName.replace('/', '').toLowerCase();
   if (REVENUE_CMDS.has(cmd)) return 'nl-query';
-  if (EXPENSE_CMDS.has(cmd)) return 'expense-query';
-  // /ask: resolve explicitly by channel membership
-  if (EXPENSE_CHANNELS.has(channelId)) return 'expense-query';
+  if (FINANCE_CMDS.has(cmd)) return 'expense-query';
+  if (FINANCE_CHANNELS.has(channelId)) return 'expense-query';
   if (REVENUE_CHANNELS.has(channelId)) return 'nl-query';
-  return null; // channel known but domain ambiguous — prompt user
+  return null;
 }
 
 function engineLabel(engine: Engine): string {
-  return engine === 'nl-query' ? 'revenue' : 'expense';
+  return engine === 'nl-query' ? 'revenue' : 'finance';
 }
 
 function thinkingMessage(engine: Engine): string {
-  const emoji = engine === 'nl-query' ? '💰' : '🧾';
+  const emoji = engine === 'nl-query' ? '💰' : '📊';
   return `${emoji} Analyzing your ${engineLabel(engine)} data…`;
 }
 
 function usageHint(commandName: string): string {
   const cmd = commandName || '/ask';
-  const isExpense = EXPENSE_CMDS.has(cmd.replace('/', ''));
-  if (isExpense) {
-    return `💡 Usage: \`${cmd} What did we spend on travel this month?\`\n\nExamples:\n• _Top vendors by spend this year_\n• _What bills are due this week?_\n• _Who has outstanding reimbursable expenses?_`;
+  const isFinance = FINANCE_CMDS.has(cmd.replace('/', ''));
+  if (isFinance) {
+    return `💡 Usage: \`${cmd} What did we spend on travel this month?\`\n\nExamples:\n• _Top vendors by spend this year_\n• _What bills are due this week?_\n• _Who has outstanding reimbursable expenses?_\n\nFeedback:\n• \`/teach [rule]\` — teach me a rule for better answers\n• \`/wrong [correction]\` — flag an incorrect answer\n• \`/learn [rule]\` — same as /teach`;
   }
   return `💡 Usage: \`${cmd} What is our MTD revenue?\`\n\nExamples:\n• _Top 5 customers this year_\n• _Are we ahead of target?_\n• _Current forecast vs actuals_`;
+}
+
+function formatModelName(modelId: string): string {
+  if (modelId.includes('gemini-3.1-flash-lite')) return 'Gemini 3.1 Lite';
+  if (modelId.includes('gemini-3-flash')) return 'Gemini 3 Flash';
+  if (modelId.includes('gemini-2.5-flash')) return 'Gemini 2.5 Flash';
+  if (modelId.includes('gemini')) return 'Gemini';
+  if (modelId.includes('sonnet')) return 'Sonnet 4.6';
+  if (modelId.includes('haiku')) return 'Haiku 4.5';
+  return modelId;
 }
 
 Deno.serve(async (req: Request) => {
@@ -67,7 +74,7 @@ Deno.serve(async (req: Request) => {
   if (!engine) {
     return jsonResponse({
       response_type: 'ephemeral',
-      text: `🤔 Not sure which data to query here. Try a specific command: \`/revenue\`, \`/forecast\`, \`/expense\`, \`/ap\`, \`/ar\`, or \`/po\``,
+      text: `🤔 Not sure which data to query here. Try a specific command: \`/revenue\`, \`/forecast\`, \`/finance\`, \`/ap\`, \`/ar\`, or \`/po\``,
     });
   }
 
@@ -114,7 +121,7 @@ async function processQuestion(
             type: 'context',
             elements: [{
               type: 'mrkdwn',
-              text: `Asked by <@${userId}> via \`${cmdDisplay}\` · ${data.rows ?? 0} row${data.rows === 1 ? '' : 's'} · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s`,
+              text: `Asked by <@${userId}> via \`${cmdDisplay}\` · ${data.rows ?? 0} row${data.rows === 1 ? '' : 's'} · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s${data.model_used ? ` · ${formatModelName(data.model_used)}` : ''}`,
             }],
           },
         ],

@@ -1,6 +1,7 @@
 import { loadTemplate, resolveParams, type FlowTemplate } from './template-loader.js';
 import { runDigest, type DigestChannel } from '../digest/index.js';
 import { buildDigestConfig } from '../config.js';
+import { executeXeroSync, type XeroSyncOptions } from './xero-sync-executor.js';
 
 export interface ExecuteOptions {
   template_id: string;
@@ -54,8 +55,14 @@ async function routeExecution(
     case 'daily-revenue-report':
       return executeDigest(params, dryRun, connect, userId, supabaseUrl, supabaseKey);
 
+    case 'daily-xero-sync': {
+      const xeroToken = (params as Record<string, unknown>).xero_access_token as string;
+      if (!xeroToken) throw new Error('daily-xero-sync requires xero_access_token in overrides');
+      return executeXeroSync({ xeroAccessToken: xeroToken, dryRun, overrides: params });
+    }
+
     default:
-      throw new Error(`No executor registered for template "${template.id}". Known templates: daily-revenue-report`);
+      throw new Error(`No executor registered for template "${template.id}". Known templates: daily-revenue-report, daily-xero-sync`);
   }
 }
 
