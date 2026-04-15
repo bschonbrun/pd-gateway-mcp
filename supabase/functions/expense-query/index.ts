@@ -359,12 +359,13 @@ const DATA_SUMMARY = `*Financial Intelligence — Available Data* 📊\n\n*💳 
 
 const EXPENSE_SCHEMA_CONTEXT = `
 ## BUSINESS CONTEXT
-Acme Corp financial data from five sources:
+Acme Corp financial data from six sources:
 1. FLOAT FINANCIAL: corporate cards (direct-pay)
 2. EXPENSIFY: employee expenses (reimbursable + billable)
 3. XERO AP: vendor invoices — two entities, both USD
 4. XERO AR: customer invoices — two entities, both USD
 5. XERO GL: journals, bank transactions, chart of accounts, credit notes
+6. SALES ORDERS: the authoritative source for revenue — use for current/MTD/QTD/YTD revenue
 
 XERO ENTITIES:
 - 'Acme Water Treatment - USD' = US
@@ -418,12 +419,23 @@ XERO ENTITIES:
 ## gl_category_mappings
   category_name text UNIQUE, account_codes text[], description text
 
+## sales_orders (REVENUE — AUTHORITATIVE SOURCE)
+  row_id text PK, order_number integer, customer_name text, site_name text,
+  order_date timestamptz, delivery_date timestamptz, month text, year integer,
+  totes numeric, gallons numeric, amount numeric (revenue value in USD),
+  cost_per_gallon numeric, cost_per_lb numeric, price_by text,
+  is_draft boolean, is_cancelled boolean, sales_rep text,
+  ship_mode text, reference_number text, order_invoice text
+  FILTERS: WHERE NOT is_draft AND NOT is_cancelled
+
 ## FORMULA PRIORITY
 1. FIRST check RELEVANT FINANCIAL DEFINITIONS
 2. THEN apply company-specific rules
 3. NEVER invent formulas when definitions exist
 
 ## CRITICAL RULES
+- REVENUE: Use sales_orders (NOT xero_ar_invoices) for revenue queries (MTD, QTD, YTD, by customer, etc.). Filter: WHERE NOT is_draft AND NOT is_cancelled. Revenue column is "amount".
+- xero_ar_invoices is for AR/collections/DSO analysis only, NOT revenue reporting
 - xero_contacts uses "name" NOT "contact_name"
 - AP outstanding: status = 'AUTHORISED' AND amount_due > 0
 - AR outstanding: status = 'AUTHORISED' AND amount_due > 0
