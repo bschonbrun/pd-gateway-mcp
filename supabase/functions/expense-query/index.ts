@@ -56,7 +56,7 @@ interface EngineRequest {
 }
 
 interface GoldenExample { question: string; correct_sql: string; }
-interface FinancialDefinition { term: string; category: string; definition: string; formula: string | null; sql_template: string | null; }
+interface FinancialDefinition { term: string; category: string; definition: string; formula: string | null; sql_template: string | null; keywords: string[] | null; }
 interface KnowledgeTerm { term: string; standard_ref?: string; asc_code?: string; category: string; definition: string; guidance: string | null; example: string | null; }
 interface ConversationContext { question: string; sql: string; answer: string; }
 interface FeedbackRule { correction: string; feedback_type: string; question: string; created_at: string; }
@@ -93,7 +93,7 @@ async function fetchGoldenExamples(url: string, key: string): Promise<GoldenExam
   return dbFetch<GoldenExample>(url, key, 'expense_query_golden?approved=eq.true&promoted=eq.true&select=question,correct_sql&order=created_at.asc');
 }
 async function fetchFinancialDefinitions(url: string, key: string): Promise<FinancialDefinition[]> {
-  return dbFetch<FinancialDefinition>(url, key, 'financial_definitions?active=eq.true&select=term,category,definition,formula,sql_template&order=category.asc,term.asc');
+  return dbFetch<FinancialDefinition>(url, key, 'financial_definitions?active=eq.true&select=term,category,definition,formula,sql_template,keywords&order=category.asc,term.asc');
 }
 async function fetchKnowledgeTerms(url: string, key: string, table: 'gaap_terms' | 'ifrs_terms'): Promise<KnowledgeTerm[]> {
   const fields = table === 'gaap_terms' ? 'term,asc_code,category,definition,guidance,example' : 'term,standard_ref,category,definition,guidance,example';
@@ -932,12 +932,19 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── DEFINITION TEMPLATE SHORTCUT (use verified sql_template when available)
+  // Score each template by word matches — prefer most specific match
   const qWords = new Set(question.toLowerCase().split(/\s+/));
-  const directDef = allDefinitions.find(d => {
-    if (!d.sql_template) return false;
-    const termWords = d.term.toLowerCase().split(/\s+/);
-    return termWords.every(w => qWords.has(w));
-  });
+  const directDef = allDefinitions
+    .filter(d => d.sql_template)
+    .map(d => {
+      const termWords = d.term.toLowerCase().split(/\s+/);
+      const termHits = termWords.filter(w => qWords.has(w)).length;
+      const keywordHits = (d.keywords ?? []).filter((k: string) => qWords.has(k.toLowerCase())).length;
+      const isFullMatch = termWords.every(w => qWords.has(w));
+      return { def: d, score: isFullMatch ? termHits + keywordHits : 0 };
+    })
+    .filter(m => m.score > 0)
+    .sort((a, b) => b.score - a.score)[0]?.def ?? null;
   if (directDef?.sql_template && !resolution) {
     await progress('✅ Using verified definition template...');
     const templateSql = directDef.sql_template;
