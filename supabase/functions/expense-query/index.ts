@@ -1,12 +1,25 @@
-// expense-query v53 — compact transparency, citation stripping, debug/explain hints
+// expense-query v55 — global + per-call timeouts
 // Normal: auto-resolve >= 0.8 confidence, ask user < 0.8
 // Training: auto-resolve >= 0.2 confidence, ask user < 0.2
 // Golden example matches = 100% confidence (always auto)
+// Audit: self-correct when confidence < 0.7 (auditor thinks original is <70% correct)
+
+// ─── TIMEOUTS ───
+
+const GLOBAL_TIMEOUT_MS = 90_000;  // 90s hard ceiling for entire request
+const API_CALL_TIMEOUT_MS = 30_000; // 30s per external API call
+
+function timedFetch(url: string, opts: RequestInit, timeoutMs = API_CALL_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...opts, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
 
 // ─── CONFIDENCE THRESHOLDS ───
 
 const NORMAL_THRESHOLD = 0.8;
 const TRAINING_THRESHOLD = 0.2;
+const AUDIT_CONFIDENCE_FLOOR = 0.7;
 function getThreshold(mode: 'normal' | 'training'): number {
   return mode === 'normal' ? NORMAL_THRESHOLD : TRAINING_THRESHOLD;
 }
@@ -22,6 +35,7 @@ const EXPLAIN_PATTERNS = /^\s*(?:\/)?explain:?\s*$/i;
 const DEFINITIONS_PATTERNS = /^\s*(?:\/)?definitions?:?\s*$/i;
 const INTERPRETATION_PATTERNS = /^\s*(?:\/)?interpretation:?\s*$/i;
 const AUDIT_PATTERNS = /^\s*(?:\/)?audit:?\s*$/i;
+const RESOLVE_PATTERNS = /^\s*(?:\/)?resolve:?\s*$/i;
 const TRAIN_PATTERN = /^\s*train\s*$/i;
 const TRAIN_PREFIX = /^\s*train[:\s]+\s*/i;
 const NORMAL_PATTERN = /^\s*normal\s*$/i;
@@ -161,7 +175,7 @@ IMPORTANT: Include multi-word business terms like "raw materials", "cost of good
 
 async function researchTermViaPerplexity(term: string, apiKey: string): Promise<{ definition: string; formula: string; sql_hint: string; confidence: number } | null> {
   try {
-    const res = await fetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: 'You are a financial analyst defining accounting terms for a water treatment / chemical manufacturing company. Return JSON only.' }, { role: 'user', content: `Define "${term}" for a manufacturing company. Return ONLY valid JSON:\n{"definition": "one sentence", "formula": "formula or N/A", "sql_hint": "which columns", "confidence": 0.0-1.0}\n\nconfidence = how sure you are this is the standard industry definition (1.0 = textbook definition, 0.5 = could vary by company)` }], max_tokens: 300 }) });
+    const res = await timedFetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: 'You are a financial analyst defining accounting terms for a water treatment / chemical manufacturing company. Return JSON only.' }, { role: 'user', content: `Define "${term}" for a manufacturing company. Return ONLY valid JSON:\n{"definition": "one sentence", "formula": "formula or N/A", "sql_hint": "which columns", "confidence": 0.0-1.0}\n\nconfidence = how sure you are this is the standard industry definition (1.0 = textbook definition, 0.5 = could vary by company)` }], max_tokens: 300 }) });
     if (!res.ok) return null;
     const data = await res.json(); const text = data.choices?.[0]?.message?.content ?? '';
     const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -223,7 +237,7 @@ function buildAuditClarification(_question: string, issues: string, _sql: string
 async function auditSQLViaPerplexity(question: string, sql: string, relevantDefs: FinancialDefinition[], apiKey: string): Promise<{ passed: boolean; issues: string; corrected_sql?: string; confidence: number }> {
   const defsContext = relevantDefs.map(d => `${d.term}: ${d.definition}${d.formula ? ` (Formula: ${d.formula})` : ''}`).join('\n');
   try {
-    const res = await fetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: 'You audit SQL queries for financial accuracy. Return ONLY valid JSON.' }, { role: 'user', content: `Question: "${question}"\n\nSQL:\n${sql}\n\nFinancial definitions:\n${defsContext || 'None'}\n\nDoes this SQL correctly answer the question? Return JSON:\n{"passed": true/false, "issues": "description or 'none'", "corrected_sql": "fixed SQL or null", "confidence": 0.0-1.0}\n\nconfidence = how confident you are the ORIGINAL SQL is correct (1.0 = perfect, 0.5 = uncertain, 0.0 = definitely wrong)` }], max_tokens: 800 }) });
+    const res = await timedFetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: 'You audit SQL queries for financial accuracy. Return ONLY valid JSON.' }, { role: 'user', content: `Question: "${question}"\n\nSQL:\n${sql}\n\nFinancial definitions:\n${defsContext || 'None'}\n\nDoes this SQL correctly answer the question? Return JSON:\n{"passed": true/false, "issues": "description or 'none'", "corrected_sql": "fixed SQL or null", "confidence": 0.0-1.0}\n\nconfidence = how confident you are the ORIGINAL SQL is correct (1.0 = perfect, 0.5 = uncertain, 0.0 = definitely wrong)` }], max_tokens: 800 }) });
     if (!res.ok) return { passed: true, issues: 'Audit unavailable', confidence: 0.5 };
     const data = await res.json(); const text = data.choices?.[0]?.message?.content ?? '';
     const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -401,10 +415,10 @@ const COMPLEX_PATTERNS = /\b(compar|vs\.?|versus|percent|trend|rank|top \d|botto
 function isComplexQuery(q: string): boolean { return COMPLEX_PATTERNS.test(q); }
 
 async function callGemini(sys: string, msg: string, key: string, model: string): Promise<LLMResult | null> {
-  try { const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ system_instruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: msg }] }] }) }); if (!res.ok) return null; const data = await res.json(); return { text: data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '', model }; } catch { return null; }
+  try { const res = await timedFetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ system_instruction: { parts: [{ text: sys }] }, contents: [{ role: 'user', parts: [{ text: msg }] }] }) }); if (!res.ok) return null; const data = await res.json(); return { text: data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '', model }; } catch { return null; }
 }
 async function callAnthropic(sys: string, msg: string, key: string, model: string, max = 1024): Promise<LLMResult | null> {
-  try { const res = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model, max_tokens: max, system: sys, messages: [{ role: 'user', content: msg }] }) }); if (!res.ok) return null; const data = await res.json(); return { text: data.content[0]?.text?.trim() ?? '', model }; } catch { return null; }
+  try { const res = await timedFetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model, max_tokens: max, system: sys, messages: [{ role: 'user', content: msg }] }) }); if (!res.ok) return null; const data = await res.json(); return { text: data.content[0]?.text?.trim() ?? '', model }; } catch { return null; }
 }
 async function callLLM(sys: string, msg: string, aKey: string, gKey: string | undefined, max = 1024, complex?: boolean): Promise<LLMResult> {
   for (const { provider, model } of (complex ? COMPLEX_CHAIN : SIMPLE_CHAIN)) { if (provider === 'gemini' && !gKey) continue; const r = provider === 'gemini' ? await callGemini(sys, msg, gKey!, model) : await callAnthropic(sys, msg, aKey, model, max); if (r) return r; }
@@ -528,7 +542,7 @@ async function saveVerifiedGolden(url: string, key: string, question: string, ve
 // ─── PERPLEXITY RESEARCH ───
 
 const RESEARCH_SYS = 'Financial research for water treatment/chemical manufacturing. Concise Slack, 3-5 bullets, cite sources.';
-async function callPerplexity(question: string, apiKey: string): Promise<{ text: string; citations: string[] }> { const res = await fetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: RESEARCH_SYS }, { role: 'user', content: question }], max_tokens: 1024 }) }); if (!res.ok) throw new Error(`Perplexity ${res.status}`); const data = await res.json(); return { text: data.choices?.[0]?.message?.content ?? '', citations: data.citations ?? [] }; }
+async function callPerplexity(question: string, apiKey: string): Promise<{ text: string; citations: string[] }> { const res = await timedFetch('https://api.perplexity.ai/chat/completions', { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'sonar', messages: [{ role: 'system', content: RESEARCH_SYS }, { role: 'user', content: question }], max_tokens: 1024 }) }); if (!res.ok) throw new Error(`Perplexity ${res.status}`); const data = await res.json(); return { text: data.choices?.[0]?.message?.content ?? '', citations: data.citations ?? [] }; }
 function extractMetricKeywords(q: string): string[] { const metrics = ['dso', 'dpo', 'ar aging', 'ap aging', 'gross margin', 'operating margin', 'ebitda', 'current ratio', 'quick ratio', 'collection rate', 'burn rate', 'cash conversion cycle', 'working capital', 'debt to equity', 'revenue growth', 'inventory turnover']; const lower = q.toLowerCase(); return metrics.filter(m => lower.includes(m)); }
 
 // ─── MAIN HANDLER ───
@@ -554,6 +568,7 @@ Deno.serve(async (req: Request) => {
   if (!user_id) return Response.json({ error: 'user_id required' }, { status: 400 });
 
   const ms = () => Date.now() - startMs;
+  const isOverDeadline = () => ms() > GLOBAL_TIMEOUT_MS;
   const progress = (text: string) => updateSlackProgress(slack_bot_token, slack_channel, slack_thread_ts, text);
 
   let mode: 'normal' | 'training' = body.mode ?? 'normal';
@@ -653,7 +668,55 @@ Deno.serve(async (req: Request) => {
     const confExplain = confPct >= 80 ? 'The SQL closely matches the expected query pattern.'
       : confPct >= 50 ? 'The SQL partially matches expected patterns — some aspects may need verification.'
       : 'The SQL diverges significantly from expected patterns — manual review recommended.';
-    return Response.json({ answer: `🔬 *Audit for:* _"${recent.question}"_\n\n• *Confidence:* ${confPct}% (${confLabel})\n  _${confExplain}_\n• *Auto-correction:* ${a.autoApplied ? 'Yes — SQL was modified based on audit findings' : 'No'}\n• *Issues found:* ${a.issues === 'none' ? 'None' : a.full_text}\n\n_Type \`debug:\` to see the actual SQL, or \`wrong: [correction]\` to provide feedback._` });
+    const hasIssues = a.issues !== 'none' && confPct < 70;
+    const resolveHint = hasIssues ? '\n\n_Click *🔧 Resolve* or type `resolve:` to have me fix this automatically._' : '';
+    return Response.json({ answer: `🔬 *Audit for:* _"${recent.question}"_\n\n• *Confidence:* ${confPct}% (${confLabel})\n  _${confExplain}_\n• *Auto-correction:* ${a.autoApplied ? 'Yes — SQL was modified based on audit findings' : 'No'}\n• *Issues found:* ${a.issues === 'none' ? 'None' : a.full_text}${resolveHint}\n\n_Type \`debug:\` to see the actual SQL, or \`wrong: [correction]\` to provide feedback._` });
+  }
+
+  if (RESOLVE_PATTERNS.test(question)) {
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query to resolve.' });
+    const meta = recent.transparency_meta;
+    if (!meta?.audit?.ran || meta.audit.issues === 'none') return Response.json({ answer: '✅ No audit issues to resolve — the last query looks good.' });
+
+    await progress('🔧 Resolving audit issues...');
+    const [examples, allDefs] = await Promise.all([fetchGoldenExamples(supabaseUrl, supabaseKey), fetchFinancialDefinitions(supabaseUrl, supabaseKey)]);
+    const relevantDefs = matchRelevantDefinitions(recent.question, allDefs);
+    const defsContext = relevantDefs.map(d => `${d.term}: ${d.definition}${d.formula ? ` (Formula: ${d.formula})` : ''}`).join('\n');
+
+    const constrainedPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs);
+    const constrainedQuestion = `${recent.question}\n\nIMPORTANT CORRECTION: A previous attempt generated incorrect SQL. The auditor found these issues:\n${meta.audit.full_text}\n\nRelevant financial definitions:\n${defsContext}\n\nYou MUST follow the definitions exactly. Generate corrected SQL.`;
+
+    try {
+      const sqlResult = await callLLM(constrainedPrompt, constrainedQuestion, anthropicKey, geminiKey, 1024, true);
+      const newSql = cleanSQL(sqlResult.text);
+      if (!validateSQL(newSql).valid) return Response.json({ answer: '❌ Could not generate valid corrected SQL. Please use `wrong: [your correction]` to teach me the right approach.' });
+
+      // Re-audit the corrected SQL
+      let reauditPassed = true;
+      if (perplexityKey && relevantDefs.length > 0) {
+        await progress('🔎 Re-auditing corrected SQL...');
+        const reaudit = await auditSQLViaPerplexity(recent.question, newSql, relevantDefs, perplexityKey);
+        reauditPassed = reaudit.passed || reaudit.confidence >= AUDIT_CONFIDENCE_FLOOR;
+      }
+
+      await progress('📊 Running corrected query...');
+      const result = await executeQuery(newSql, supabaseUrl, supabaseKey);
+
+      const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${recent.question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
+
+      // Save as golden if re-audit passed
+      if (reauditPassed) {
+        await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, newSql, `Auto-resolved from audit issues: ${meta.audit.issues}`);
+      }
+
+      await deleteSlackProgress(slack_bot_token, slack_channel);
+      const statusLine = reauditPassed ? '✅ *Resolved and saved as verified answer.*' : '⚠️ *Resolved but re-audit had concerns — not saved as golden.*';
+      return Response.json({ answer: `🔧 *Resolved:* _"${recent.question}"_\n\n${fmt.text}\n\n${statusLine}\n_The corrected SQL now uses the proper formula from your definitions._` });
+    } catch (e) {
+      await deleteSlackProgress(slack_bot_token, slack_channel);
+      return Response.json({ answer: `❌ Resolve failed: ${(e as Error).message}\n\nPlease use \`wrong: [your correction]\` to teach me manually.` });
+    }
   }
 
   if (FEEDBACK_PATTERNS.test(question)) {
@@ -731,10 +794,13 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── 6a. Unknown term detection (LLM-based)
-  await progress('🔍 Checking for unfamiliar terms...');
-  const unknownTerms = await detectUnknownTermsViaLLM(question, allDefinitions, anthropicKey, geminiKey);
   let researchedDefs: { term: string; definition: string; formula: string }[] = [];
   const termsResearched: string[] = [];
+  let unknownTerms: string[] = [];
+  if (!isOverDeadline()) {
+    await progress('🔍 Checking for unfamiliar terms...');
+    unknownTerms = await detectUnknownTermsViaLLM(question, allDefinitions, anthropicKey, geminiKey);
+  }
 
   if (unknownTerms.length > 0 && perplexityKey) {
     const term = unknownTerms[0];
@@ -783,7 +849,7 @@ Deno.serve(async (req: Request) => {
   let ambiguityAutoSelected: string | undefined;
   let ambiguityConfidence = 1.0;
 
-  if (!resolution) {
+  if (!resolution && !isOverDeadline()) {
     await progress('🧠 Checking for ambiguity...');
     const ambiguityCheck = await checkAmbiguity(question, anthropicKey, geminiKey);
     if (ambiguityCheck.isAmbiguous && ambiguityCheck.interpretations?.length) {
@@ -835,31 +901,54 @@ Deno.serve(async (req: Request) => {
     return Response.json({ answer: reason.startsWith('CANNOT_ANSWER:') ? `I don't have that data. ${reason.replace('CANNOT_ANSWER:', '').trim()}` : 'Could not generate a valid query.', duration_ms: ms() });
   }
 
-  // ── 6c. Audit SQL (confidence-gated)
+  // ── 6c. Audit SQL (confidence-gated, self-correcting)
   let audited = false;
   let auditIssues = 'none';
   let auditAutoApplied = false;
   let auditConfidence = 1.0;
-  if (perplexityKey && relevantDefs.length > 0) {
+  if (perplexityKey && relevantDefs.length > 0 && !isOverDeadline()) {
     await progress('🔎 Auditing query...');
     const audit = await auditSQLViaPerplexity(question, sql, relevantDefs, perplexityKey);
     audited = true;
     auditIssues = audit.issues;
     auditConfidence = audit.confidence;
 
-    if (!audit.passed && audit.corrected_sql) {
-      if (audit.confidence < threshold && !resolution) {
-        const clarification = buildAuditClarification(question, audit.issues, sql, audit.corrected_sql);
-        await deleteSlackProgress(slack_bot_token, slack_channel);
-        return Response.json({
-          type: 'clarification', clarification_type: 'audit_conflict',
-          message: clarification.message, options: clarification.options,
-          context: { original_sql: sql, corrected_sql: audit.corrected_sql, issues: audit.issues, original_question: question, confidence: audit.confidence },
-          duration_ms: ms(),
-        });
+    // Self-correction: only attempt if we have time budget remaining
+    if ((!audit.passed || audit.confidence < AUDIT_CONFIDENCE_FLOOR) && !isOverDeadline()) {
+      if (audit.corrected_sql) {
+        const corrected = cleanSQL(audit.corrected_sql);
+        if (validateSQL(corrected).valid && !isOverDeadline()) {
+          const reaudit = await auditSQLViaPerplexity(question, corrected, relevantDefs, perplexityKey);
+          if (reaudit.passed || reaudit.confidence >= AUDIT_CONFIDENCE_FLOOR) {
+            sql = corrected;
+            modelUsed = `${modelUsed} (audit-corrected)`;
+            auditAutoApplied = true;
+            auditConfidence = reaudit.confidence;
+            auditIssues = reaudit.issues;
+          }
+        }
       }
-      const corrected = cleanSQL(audit.corrected_sql);
-      if (validateSQL(corrected).valid) { sql = corrected; modelUsed = `${modelUsed} (audited)`; auditAutoApplied = true; }
+
+      // Retry with feedback — only if we still have time
+      if (!auditAutoApplied && audit.issues !== 'none' && !isOverDeadline()) {
+        await progress('🔄 Retrying with audit feedback...');
+        const defsCtx = relevantDefs.map(d => `${d.term}: ${d.definition}${d.formula ? ` (Formula: ${d.formula})` : ''}`).join('\n');
+        const retryQuestion = `${enrichedQuestion}\n\nCRITICAL: A code auditor found issues with the previous SQL attempt:\n${audit.issues}\n\nFinancial definitions to follow:\n${defsCtx}\n\nYou MUST generate SQL that follows the definitions exactly.`;
+        try {
+          const retryResult = await callLLM(sqlPrompt, retryQuestion, anthropicKey, geminiKey, 1024, true);
+          const retrySql = cleanSQL(retryResult.text);
+          if (validateSQL(retrySql).valid && !isOverDeadline()) {
+            const reaudit = await auditSQLViaPerplexity(question, retrySql, relevantDefs, perplexityKey);
+            if (reaudit.passed || reaudit.confidence > audit.confidence) {
+              sql = retrySql;
+              modelUsed = `${retryResult.model} (audit-retried)`;
+              auditAutoApplied = true;
+              auditConfidence = reaudit.confidence;
+              auditIssues = reaudit.issues;
+            }
+          }
+        } catch { /* retry failed — use original */ }
+      }
     }
   }
 
@@ -869,10 +958,17 @@ Deno.serve(async (req: Request) => {
     else if (resolution.option === 'B') { sql = cleanSQL(ctx.corrected_sql as string); modelUsed = `${modelUsed} (audited)`; }
   }
 
+  // Global deadline check — bail before executing if we're already over
+  if (isOverDeadline()) {
+    await deleteSlackProgress(slack_bot_token, slack_channel);
+    return Response.json({ answer: '⏱️ That question took too long. Try breaking it into a simpler query.', duration_ms: ms() });
+  }
+
   await progress('📊 Running query...');
   let rows: unknown[], finalSql = sql, finalModel = modelUsed;
   try { const result = await executeQuery(sql, supabaseUrl, supabaseKey); rows = result.rows; }
   catch (firstError) {
+    if (isOverDeadline()) { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: '⏱️ That question took too long. Try breaking it into a simpler query.', duration_ms: ms() }); }
     await progress('🔄 Retrying...');
     try { const retry = await callLLM(sqlPrompt, `SQL failed:\n${sql}\nERROR: ${firstError}\nFix it. Output ONLY SQL.`, anthropicKey, geminiKey, 1024, true); const retrySql = cleanSQL(retry.text); if (validateSQL(retrySql).valid) { const r = await executeQuery(retrySql, supabaseUrl, supabaseKey); rows = r.rows; finalSql = retrySql; finalModel = retry.model; } else throw firstError; }
     catch { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: 'Problem running that query.', sql, error: String(firstError), duration_ms: ms() }); }
