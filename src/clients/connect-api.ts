@@ -2,6 +2,8 @@
 // Auth: OAuth2 client credentials (auto-refresh)
 // Endpoints: app discovery, action listing, action execution
 
+import { PD_ENVIRONMENT, TIMEOUTS } from '../config.js';
+
 const BASE_URL = 'https://api.pipedream.com/v1';
 
 export class PipedreamConnectClient {
@@ -25,6 +27,7 @@ export class PipedreamConnectClient {
         client_id: this.clientId,
         client_secret: this.clientSecret,
       }),
+      signal: AbortSignal.timeout(TIMEOUTS.authToken),
     });
 
     if (!res.ok) throw new Error(`OAuth token error: ${res.status}`);
@@ -39,10 +42,11 @@ export class PipedreamConnectClient {
       ...options,
       headers: {
         'Authorization': `Bearer ${this.accessToken}`,
-        'X-PD-Environment': 'development',
+        'X-PD-Environment': PD_ENVIRONMENT,
         'Content-Type': 'application/json',
         ...options.headers,
       },
+      signal: AbortSignal.timeout(TIMEOUTS.connectApi),
     });
     if (!res.ok) throw new Error(`Connect API error: ${res.status} ${await res.text()}`);
     return res.json();

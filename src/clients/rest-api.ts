@@ -2,6 +2,8 @@
 // Auth: API Key (Bearer token)
 // Endpoints: workflow CRUD, event history
 
+import { TIMEOUTS } from '../config.js';
+
 const BASE_URL = 'https://api.pipedream.com/v1';
 
 export class PipedreamRestClient {
@@ -23,6 +25,7 @@ export class PipedreamRestClient {
         'Content-Type': 'application/json',
         ...(options.headers as Record<string, string>),
       },
+      signal: AbortSignal.timeout(TIMEOUTS.restApi),
     });
     if (!res.ok) throw new Error(`Pipedream API error: ${res.status} ${await res.text()}`);
     return res.json();
@@ -45,6 +48,7 @@ export class PipedreamRestClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
+      signal: AbortSignal.timeout(TIMEOUTS.webhook),
     });
     return { status: res.status, body: await res.text() };
   }
@@ -61,4 +65,3 @@ export class PipedreamRestClient {
     return this.request(`/workflows/${id}`, { method: 'DELETE' });
   }
 }
-

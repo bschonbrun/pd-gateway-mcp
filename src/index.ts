@@ -6,10 +6,10 @@ import { z } from 'zod';
 import { PipedreamRestClient } from './clients/rest-api.js';
 import { PipedreamConnectClient } from './clients/connect-api.js';
 import { runDigest } from './digest/index.js';
-import type { SenderConfig } from './digest/senders.js';
 import { listTemplates } from './engine/template-loader.js';
 import { executeTemplate } from './engine/template-executor.js';
 import { deployTemplateWorkflow, updateWorkflowWebhook } from './deployer/workflow-deployer.js';
+import { buildDigestConfig, TIMEOUTS } from './config.js';
 
 const env = (key: string): string => {
   const val = process.env[key];
@@ -266,9 +266,9 @@ server.tool(
 
 // ── WhatsApp Tool (Twilio Direct) ───────────────────────────────────
 
-const TWILIO_SID = process.env['TWILIO_ACCOUNT_SID'] || '';
-const TWILIO_TOKEN = process.env['TWILIO_AUTH_TOKEN'] || '';
-const TWILIO_WA_FROM = process.env['TWILIO_WHATSAPP_FROM'] || 'whatsapp:+12362332112';
+const TWILIO_SID   = process.env['TWILIO_ACCOUNT_SID']  || '';
+const TWILIO_TOKEN = process.env['TWILIO_AUTH_TOKEN']    || '';
+const TWILIO_WA_FROM = process.env['TWILIO_WHATSAPP_FROM'] || '';
 
 server.tool(
   'send_whatsapp',
@@ -276,19 +276,22 @@ server.tool(
   {
     to: z.string().describe('Recipient phone number with country code (e.g. "+16045551234"). The whatsapp: prefix is added automatically.'),
     body: z.string().max(1600).describe('Message text (max 1600 chars). Supports WhatsApp formatting: *bold*, _italic_, ~strikethrough~, ```monospace```'),
-    from: z.string().optional().describe('Override sender WhatsApp number (defaults to sandbox number)'),
+    from: z.string().optional().describe('Override sender WhatsApp number (defaults to TWILIO_WHATSAPP_FROM env var)'),
     media_url: z.string().url().optional().describe('Optional media URL to attach (image, PDF, etc.)'),
   },
   async ({ to, body, from, media_url }) => {
     if (!TWILIO_SID || !TWILIO_TOKEN) return fail('TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set');
+    if (!TWILIO_WA_FROM && !from) return fail('TWILIO_WHATSAPP_FROM env var must be set (or pass "from" explicitly)');
 
-    const waTo = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
-    const waFrom = from ? (from.startsWith('whatsapp:') ? from : `whatsapp:${from}`) : TWILIO_WA_FROM;
+    const waTo   = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+    const waFrom = from
+      ? (from.startsWith('whatsapp:') ? from : `whatsapp:${from}`)
+      : TWILIO_WA_FROM;
 
     const params = new URLSearchParams({ To: waTo, From: waFrom, Body: body });
     if (media_url) params.append('MediaUrl', media_url);
 
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
+    const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
     const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64');
 
     try {
@@ -296,6 +299,7 @@ server.tool(
         method: 'POST',
         headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
         body: params.toString(),
+        signal: AbortSignal.timeout(TIMEOUTS.twilio),
       });
       const data = await res.json();
       if (!res.ok) return fail(`Twilio ${res.status}: ${data.message || JSON.stringify(data)}`);
@@ -336,6 +340,7 @@ server.tool(
           'content-type': 'application/json',
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TIMEOUTS.anthropic),
       });
       const data = await res.json() as {
         content?: Array<{ type: string; text: string }>;
@@ -350,20 +355,6 @@ server.tool(
 
 // ── Daily Digest Tool ──────────────────────────────────────────────
 
-const digestConfig: SenderConfig = {
-  slackAuthProvisionId:     process.env['SLACK_AUTH_PROVISION_ID']    || 'apn_P8hEEEa',
-  outlookAuthProvisionId:   process.env['OUTLOOK_AUTH_PROVISION_ID']  || 'apn_Xeh00n7',
-  slackChannelId:           process.env['SLACK_DIGEST_CHANNEL']       || 'C0872NV9H43',
-  emailRecipients:         (process.env['DIGEST_EMAIL_RECIPIENTS']    || 'user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com,user@acme.com').split(','),
-  emailSubjectPrefix:       process.env['DIGEST_EMAIL_SUBJECT']       || 'Daily Revenue Tracker',
-  whatsappRecipients:      (process.env['DIGEST_WHATSAPP_RECIPIENTS'] || '+16047830407').split(','),
-  whatsappTemplateSid:      process.env['DIGEST_TEMPLATE_SID']        || 'HX6f733603e2f8ffb785fcf131f872565a',
-  whatsappTemplateDelayMs:  Number(process.env['DIGEST_WA_DELAY_MS']) || 15_000,
-  twilioSid:                process.env['TWILIO_ACCOUNT_SID']         || '',
-  twilioToken:              process.env['TWILIO_AUTH_TOKEN']           || '',
-  twilioWaFrom:             process.env['TWILIO_WHATSAPP_FROM']              || 'whatsapp:+12362332112',
-};
-
 server.tool(
   'run_daily_digest',
   'Run the Acme Corp daily revenue digest. Queries live Supabase data and sends formatted reports to Slack (#orders-glide) and Outlook email recipients.',
@@ -375,10 +366,10 @@ server.tool(
     try {
       const result = await runDigest(
         { dry_run, channels },
-        digestConfig,
+        buildDigestConfig(),
         process.env['SUPABASE_URL'] || '',
         process.env['SUPABASE_ANON_KEY'] || '',
-        (action, props) => connect.runAction(action, props, defaultUserId),
+        (action, props, userId) => connect.runAction(action, props, userId),
         defaultUserId,
       );
       return ok(result);
@@ -412,7 +403,7 @@ server.tool(
     try {
       const result = await executeTemplate(
         { template_id, dry_run, overrides },
-        (action, props) => connect.runAction(action, props, defaultUserId),
+        (action, props, userId) => connect.runAction(action, props, userId),
         defaultUserId,
         process.env['SUPABASE_URL'] || '',
         process.env['SUPABASE_ANON_KEY'] || '',
@@ -427,7 +418,7 @@ server.tool(
   'Deploy a template as a scheduled Pipedream workflow. Creates a cron-triggered workflow that POSTs to a webhook URL on schedule. Use update_workflow_webhook to change the target URL later.',
   {
     template_id: z.string().describe('Template ID to deploy'),
-    webhook_url: z.string().optional().describe('Target webhook URL for the cron to POST to. Defaults to DIGEST_WEBHOOK_URL env var.'),
+    webhook_url: z.string().url().optional().describe('Target webhook URL for the cron to POST to (must be a valid URL). Defaults to DIGEST_WEBHOOK_URL env var.'),
     overrides: z.record(z.string(), z.unknown()).optional().describe('Override template defaults (e.g. {"schedule": "0 14 * * 1-5"})'),
   },
   async ({ template_id, webhook_url, overrides }) => {
@@ -449,12 +440,13 @@ server.tool(
   'Update the webhook URL of a previously deployed template workflow. Use this when the Cloud API endpoint changes or to swap from a test URL to production.',
   {
     workflow_id: z.string().describe('Pipedream workflow ID (e.g. "p_abc123")'),
-    webhook_url: z.string().describe('New webhook URL to POST to on each cron tick'),
+    webhook_url: z.string().url().describe('New webhook URL to POST to on each cron tick'),
+    template_id: z.string().optional().describe('Template ID to embed in the cron POST body (recommended so the endpoint knows which template to run)'),
   },
-  async ({ workflow_id, webhook_url }) => {
+  async ({ workflow_id, webhook_url, template_id }) => {
     try {
-      const result = await updateWorkflowWebhook(workflow_id, webhook_url, rest);
-      return ok({ updated: true, workflow_id, webhook_url, result });
+      const result = await updateWorkflowWebhook(workflow_id, webhook_url, rest, template_id);
+      return ok({ updated: true, workflow_id, webhook_url, template_id, result });
     } catch (e) { return fail(e); }
   },
 );
