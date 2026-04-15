@@ -635,7 +635,7 @@ Deno.serve(async (req: Request) => {
   try { body = await req.json(); } catch { return Response.json({ error: 'Invalid JSON' }, { status: 400 }); }
 
   let { question } = body;
-  const { user_id, channel = 'unknown', command, slack_ts, slack_channel, thread_context, slack_bot_token, slack_thread_ts, resolution } = body;
+  const { user_id, channel = 'unknown', command, slack_ts, slack_channel, thread_context, slack_bot_token, slack_thread_ts, resolution, confirmed_def_idx, skip_intent } = body;
   if (!question && !body.feedback_type) return Response.json({ error: 'question or feedback_type required' }, { status: 400 });
   if (!user_id) return Response.json({ error: 'user_id required' }, { status: 400 });
 
@@ -931,35 +931,84 @@ Deno.serve(async (req: Request) => {
     } catch { /* golden SQL failed — fall through to normal pipeline */ }
   }
 
-  // ── DEFINITION TEMPLATE SHORTCUT (use verified sql_template when available)
-  // Score each template by word matches — prefer most specific match
-  const qWords = new Set(question.toLowerCase().split(/\s+/));
-  const directDef = allDefinitions
-    .filter(d => d.sql_template)
-    .map(d => {
-      const termWords = d.term.toLowerCase().split(/\s+/);
-      const termHits = termWords.filter(w => qWords.has(w)).length;
-      const keywordHits = (d.keywords ?? []).filter((k: string) => qWords.has(k.toLowerCase())).length;
-      const isFullMatch = termWords.every(w => qWords.has(w));
-      return { def: d, score: isFullMatch ? termHits + keywordHits : 0 };
-    })
-    .filter(m => m.score > 0)
-    .sort((a, b) => b.score - a.score)[0]?.def ?? null;
-  if (directDef?.sql_template && !resolution) {
-    await progress('✅ Using verified definition template...');
-    const templateSql = directDef.sql_template;
+  // ── INTENT CLASSIFIER — semantic template matching via fast LLM ──
+  const templateDefs = allDefinitions.filter(d => d.sql_template);
+
+  // Direct execution: user confirmed a specific definition via button
+  if (typeof confirmed_def_idx === 'number' && confirmed_def_idx >= 0 && confirmed_def_idx < templateDefs.length) {
+    const matchedDef = templateDefs[confirmed_def_idx];
+    await progress(`✅ Running confirmed: ${matchedDef.term}`);
+    const templateSql = matchedDef.sql_template!;
     try {
       const result = await executeQuery(templateSql, supabaseUrl, supabaseKey);
       const fmtPrompt = buildFormatPromptWithFeedback(userFeedback);
-      const fmt = await callLLM(fmtPrompt, `Q: ${question}\nDefinition: ${directDef.term} — ${directDef.definition}${directDef.formula ? `\nFormula: ${directDef.formula}` : ''}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
-      let answer = (mode === 'training' ? '🎓 ' : '') + fmt.text;
-      const transparency = buildTransparency(mode, { defsUsed: [directDef], audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: false, sql: templateSql });
+      const fmt = await callLLM(fmtPrompt, `Q: ${question}\nDefinition: ${matchedDef.term} — ${matchedDef.definition}${matchedDef.formula ? `\nFormula: ${matchedDef.formula}` : ''}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
+      let answer = fmt.text;
+      const transparency = buildTransparency(mode, { defsUsed: [matchedDef], audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: false, sql: templateSql });
       answer += transparency.text;
       answer += FEEDBACK_FOOTER;
       await deleteSlackProgress(slack_bot_token, slack_channel);
       const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
-      return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'definition_template', mode, duration_ms: ms(), transparency_meta: transparency.meta });
-    } catch { /* template SQL failed — fall through to normal pipeline */ }
+      return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'intent_confirmed', mode, duration_ms: ms(), transparency_meta: transparency.meta });
+    } catch { /* template SQL failed — fall through */ }
+  }
+
+  if (templateDefs.length > 0 && !resolution && !skip_intent) {
+    const intentCatalog = templateDefs.map((d, i) => `${i}: ${d.term} — ${d.definition}`).join('\n');
+    const intentPrompt = `You match user questions to financial metric definitions.
+Given the user's question and available metrics, return the INDEX NUMBER of the BEST matching metric.
+If no metric is a good match, return -1.
+
+RULES:
+- Match on MEANING, not exact words. "worst DSO", "slowest payers", "who takes longest to pay" all mean "DSO by Customer"
+- "how much revenue", "what's our revenue this month", "MTD sales" all mean "Revenue MTD"
+- Prefer SPECIFIC metrics over generic ones (e.g. "DSO by Customer" over "DSO" when the question mentions customers/clients)
+- Return ONLY the number, nothing else
+
+Available metrics:
+${intentCatalog}`;
+
+    try {
+      const intentResult = await callLLM(intentPrompt, question, anthropicKey, geminiKey, 16);
+      const matchIdx = parseInt(intentResult.text.trim(), 10);
+
+      if (matchIdx >= 0 && matchIdx < templateDefs.length) {
+        const matchedDef = templateDefs[matchIdx];
+
+        // In training mode: confirm intent before running
+        if (mode === 'training' && slack_bot_token && slack_channel) {
+          // Build alternatives (top 3 different options)
+          const altDefs = templateDefs.filter((_, i) => i !== matchIdx).slice(0, 2);
+          const confirmBlocks = [
+            { type: 'section', text: { type: 'mrkdwn', text: `🎓 *I think you're asking about:*\n\n> *${matchedDef.term}* — ${matchedDef.definition}` } },
+            { type: 'actions', elements: [
+              { type: 'button', text: { type: 'plain_text', text: `✅ Yes, run this`, emoji: true }, style: 'primary' as const, action_id: 'intent_confirm', value: JSON.stringify({ defIdx: matchIdx, question, channelId: slack_channel, threadTs: slack_ts, engine: 'expense-query', mode }) },
+              ...altDefs.map((alt, i) => ({ type: 'button' as const, text: { type: 'plain_text' as const, text: `${alt.term}`, emoji: true }, action_id: `intent_alt_${i}`, value: JSON.stringify({ defIdx: templateDefs.indexOf(alt), question, channelId: slack_channel, threadTs: slack_ts, engine: 'expense-query', mode }) })),
+              { type: 'button', text: { type: 'plain_text', text: `❌ None — let AI figure it out`, emoji: true }, action_id: 'intent_skip', value: JSON.stringify({ question, channelId: slack_channel, threadTs: slack_ts, engine: 'expense-query', mode }) },
+            ] },
+          ];
+          await deleteSlackProgress(slack_bot_token, slack_channel);
+          await fetch('https://slack.com/api/chat.postMessage', { method: 'POST', headers: { 'Authorization': `Bearer ${slack_bot_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: slack_channel, thread_ts: slack_ts, blocks: confirmBlocks, text: `Confirm: ${matchedDef.term}?` }) });
+          return Response.json({ answer: `Waiting for intent confirmation: ${matchedDef.term}`, intent_pending: true, duration_ms: ms() });
+        }
+
+        // Normal mode: just run the matched template
+        await progress(`✅ Matched: ${matchedDef.term}`);
+        const templateSql = matchedDef.sql_template!;
+        try {
+          const result = await executeQuery(templateSql, supabaseUrl, supabaseKey);
+          const fmtPrompt = buildFormatPromptWithFeedback(userFeedback);
+          const fmt = await callLLM(fmtPrompt, `Q: ${question}\nDefinition: ${matchedDef.term} — ${matchedDef.definition}${matchedDef.formula ? `\nFormula: ${matchedDef.formula}` : ''}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024);
+          let answer = fmt.text;
+          const transparency = buildTransparency(mode, { defsUsed: [matchedDef], audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: false, sql: templateSql });
+          answer += transparency.text;
+          answer += FEEDBACK_FOOTER;
+          await deleteSlackProgress(slack_bot_token, slack_channel);
+          const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
+          return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'intent_classifier', mode, duration_ms: ms(), transparency_meta: transparency.meta });
+        } catch { /* template SQL failed — fall through */ }
+      }
+    } catch { /* intent classifier failed — fall through to old pipeline */ }
   }
 
   // ── 6a. Unknown term detection (LLM-based)

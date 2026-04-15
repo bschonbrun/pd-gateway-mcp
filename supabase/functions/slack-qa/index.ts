@@ -166,6 +166,24 @@ function handleInteraction(payload: Record<string, unknown>): Response {
     return jsonResponse({ delete_original: true });
   }
 
+  // Intent confirmation buttons (from training mode intent classifier)
+  if (actionId.startsWith('intent_confirm') || actionId.startsWith('intent_alt_')) {
+    const { defIdx, question, channelId, threadTs, engine, mode } = JSON.parse(action.value as string) as {
+      defIdx: number; question: string; channelId: string; threadTs: string; engine: Engine; mode: string;
+    };
+    // Re-call expense-query with the confirmed definition index
+    callEngine(engine, question, userId, channelId, threadTs, mode, { confirmed_def_idx: defIdx });
+    return jsonResponse({ text: '' });
+  }
+  if (actionId === 'intent_skip') {
+    const { question, channelId, threadTs, engine, mode } = JSON.parse(action.value as string) as {
+      question: string; channelId: string; threadTs: string; engine: Engine; mode: string;
+    };
+    // Re-call with skip flag to bypass intent classifier
+    callEngine(engine, question, userId, channelId, threadTs, mode, { skip_intent: true });
+    return jsonResponse({ text: '' });
+  }
+
   // Drill-down buttons (definitions, interpretation, audit)
   if (actionId.startsWith('drilldown_')) {
     const command = actionId.replace('drilldown_', '');
@@ -227,8 +245,48 @@ function buildDrilldownButtons(
       });
     }
   }
-
   return elements.length ? [{ type: 'actions', elements }] : [];
+}
+
+// ─── CALL ENGINE WITH EXTRA PARAMS (for intent confirmation) ───────────────────
+async function callEngine(
+  engine: Engine, question: string, userId: string, channelId: string,
+  threadTs: string, mode: string, extra: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await slackPost('chat.postMessage', {
+      channel: channelId, thread_ts: threadTs,
+      text: `${engine === 'nl-query' ? '💰' : '📊'} Running confirmed query…`,
+    });
+
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/${engine}`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question, user_id: userId, channel: channelId, mode,
+        slack_bot_token: SLACK_BOT_TOKEN, slack_channel: channelId, slack_thread_ts: threadTs,
+        ...extra,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok && !data.answer) throw new Error(data.error || `Engine returned ${res.status}`);
+
+    const drilldownBlocks = mode === 'training'
+      ? buildDrilldownButtons(channelId, threadTs, engine, data.transparency_meta ?? null)
+      : [];
+
+    const answerText = data.answer as string;
+    const blocks: Record<string, unknown>[] = [
+      { type: 'section', text: { type: 'mrkdwn', text: answerText.slice(0, 2900) } },
+    ];
+    if (drilldownBlocks.length) blocks.push(...drilldownBlocks);
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `via \`/${engineLabel(engine)}\` · ${(data.rows ?? '?')} rows · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s · ${data.model_used ?? 'unknown'}` }] });
+
+    await slackPost('chat.postMessage', { channel: channelId, thread_ts: threadTs, blocks, text: answerText.slice(0, 200) });
+  } catch (err) {
+    await slackPost('chat.postMessage', { channel: channelId, thread_ts: threadTs, text: `❌ Error: ${err instanceof Error ? err.message : 'Unknown error'}` });
+  }
 }
 
 // ─── PROCESS + THREAD ──────────────────────────────────────────────────────────
