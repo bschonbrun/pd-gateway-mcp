@@ -1,6 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-// ─── CHANNEL CONFIG ────────────────────────────────────────────────────────────
+// ─── CONFIG ────────────────────────────────────────────────────────────────────
 const REVENUE_CHANNELS = new Set(
   (Deno.env.get('REVENUE_CHANNELS') ?? '').split(',').filter(Boolean)
 );
@@ -11,8 +11,10 @@ const ALL_ALLOWED_CHANNELS = new Set([...REVENUE_CHANNELS, ...FINANCE_CHANNELS])
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY')!;
+const SLACK_BOT_TOKEN = Deno.env.get('SLACK_BOT_TOKEN')!;
+const SLACK_SIGNING_SECRET = Deno.env.get('SLACK_SIGNING_SECRET') ?? '';
 
-// ─── COMMAND → ENGINE ROUTING ──────────────────────────────────────────────────
+// ─── ENGINE ROUTING ────────────────────────────────────────────────────────────
 type Engine = 'nl-query' | 'expense-query';
 
 const REVENUE_CMDS = new Set(['revenue', 'forecast']);
@@ -29,11 +31,6 @@ function resolveEngine(commandName: string, channelId: string): Engine | null {
 
 function engineLabel(engine: Engine): string {
   return engine === 'nl-query' ? 'revenue' : 'finance';
-}
-
-function thinkingMessage(engine: Engine): string {
-  const emoji = engine === 'nl-query' ? '💰' : '📊';
-  return `${emoji} Analyzing your ${engineLabel(engine)} data…`;
 }
 
 function usageHint(commandName: string): string {
@@ -55,26 +52,52 @@ function formatModelName(modelId: string): string {
   return modelId;
 }
 
+// ─── SLACK API HELPERS ─────────────────────────────────────────────────────────
+async function slackPost(method: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await fetch(`https://slack.com/api/${method}`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${SLACK_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return res.json() as Promise<Record<string, unknown>>;
+}
+
+// ─── MAIN HANDLER ──────────────────────────────────────────────────────────────
 Deno.serve(async (req: Request) => {
-  const formData    = await req.formData();
-  const question    = (formData.get('text') as string)?.trim();
-  const responseUrl = formData.get('response_url') as string;
-  const userId      = formData.get('user_id') as string;
-  const channelId   = formData.get('channel_id') as string;
+  const contentType = req.headers.get('content-type') ?? '';
+
+  // ── Interactive callback (button click) ──────────────────────────────────
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    const formData = await req.formData();
+    const payloadStr = formData.get('payload') as string | null;
+
+    if (payloadStr) {
+      return handleInteraction(JSON.parse(payloadStr));
+    }
+
+    // ── Slash command ──────────────────────────────────────────────────────
+    return handleSlashCommand(formData);
+  }
+
+  return new Response('Unsupported', { status: 400 });
+});
+
+// ─── SLASH COMMAND ─────────────────────────────────────────────────────────────
+async function handleSlashCommand(formData: FormData): Promise<Response> {
+  const question = (formData.get('text') as string)?.trim();
+  const userId = formData.get('user_id') as string;
+  const channelId = formData.get('channel_id') as string;
   const commandName = (formData.get('command') as string) ?? '/ask';
 
   if (!ALL_ALLOWED_CHANNELS.has(channelId)) {
-    return jsonResponse({
-      response_type: 'ephemeral',
-      text: `🔒 \`${commandName}\` is only available in authorized channels.`,
-    });
+    return jsonResponse({ response_type: 'ephemeral', text: `🔒 \`${commandName}\` is only available in authorized channels.` });
   }
 
   const engine = resolveEngine(commandName, channelId);
   if (!engine) {
     return jsonResponse({
       response_type: 'ephemeral',
-      text: `🤔 Not sure which data to query here. Try a specific command: \`/revenue\`, \`/forecast\`, \`/finance\`, \`/ap\`, \`/ar\`, or \`/po\``,
+      text: `🤔 Not sure which data to query here. Try: \`/revenue\`, \`/forecast\`, \`/finance\`, \`/ap\`, \`/ar\`, or \`/po\``,
     });
   }
 
@@ -82,25 +105,119 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ response_type: 'ephemeral', text: usageHint(commandName) });
   }
 
-  // Fire async — Slack requires a response within 3 seconds
-  processQuestion(question, responseUrl, userId, channelId, commandName, engine);
+  // If question starts with train: or normal:, skip the picker — go direct
+  const isTrainPrefix = /^train:/i.test(question);
+  const isNormalPrefix = /^normal:/i.test(question);
+  if (isTrainPrefix || isNormalPrefix) {
+    const mode = isTrainPrefix ? 'training' : 'normal';
+    const emoji = engine === 'nl-query' ? '💰' : '📊';
+    processAndThread(question, userId, channelId, commandName, engine, mode);
+    return jsonResponse({ response_type: 'ephemeral', text: `${emoji} Processing in ${mode} mode…` });
+  }
 
-  return jsonResponse({ response_type: 'ephemeral', text: thinkingMessage(engine) });
-});
+  // Show mode picker buttons
+  const emoji = engine === 'nl-query' ? '💰' : '📊';
+  return jsonResponse({
+    response_type: 'ephemeral',
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: `${emoji} *Choose a mode for your query:*\n\n> _${question}_` } },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '⚡ Normal', emoji: true },
+            style: 'primary',
+            action_id: 'mode_normal',
+            value: JSON.stringify({ question, channelId, commandName, engine }),
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '🎓 Training', emoji: true },
+            action_id: 'mode_training',
+            value: JSON.stringify({ question, channelId, commandName, engine }),
+          },
+        ],
+      },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: '_Training mode shows definitions, audit trails, and asks for your input on uncertain answers._' }],
+      },
+    ],
+  });
+}
 
-async function processQuestion(
+// ─── BUTTON INTERACTION ────────────────────────────────────────────────────────
+function handleInteraction(payload: Record<string, unknown>): Response {
+  const actions = payload.actions as Array<Record<string, unknown>>;
+  if (!actions?.length) return jsonResponse({ text: 'No action received.' });
+
+  const action = actions[0];
+  const actionId = action.action_id as string;
+  if (!actionId.startsWith('mode_')) return jsonResponse({ text: 'Unknown action.' });
+
+  const mode = actionId === 'mode_training' ? 'training' : 'normal';
+  const { question, channelId, commandName, engine } = JSON.parse(action.value as string) as {
+    question: string; channelId: string; commandName: string; engine: Engine;
+  };
+  const userId = ((payload.user as Record<string, unknown>)?.id as string) ?? 'unknown';
+
+  // Fire async
+  processAndThread(question, userId, channelId, commandName, engine, mode);
+
+  const modeLabel = mode === 'training' ? '🎓 Training' : '⚡ Normal';
+  // Replace the picker message with confirmation
+  return jsonResponse({
+    response_type: 'ephemeral',
+    replace_original: true,
+    text: `${modeLabel} mode — processing your query…`,
+  });
+}
+
+// ─── PROCESS + THREAD ──────────────────────────────────────────────────────────
+async function processAndThread(
   question: string,
-  responseUrl: string,
   userId: string,
   channelId: string,
   commandName: string,
-  engine: Engine
+  engine: Engine,
+  mode: 'normal' | 'training'
 ): Promise<void> {
   try {
+    // 1. Post Q as parent message in channel
+    const modeIcon = mode === 'training' ? '🎓' : '⚡';
+    const parentRes = await slackPost('chat.postMessage', {
+      channel: channelId,
+      text: `*Q:* _${question}_ (${modeIcon} ${mode})`,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: `*Q:* _${question}_` } },
+        { type: 'context', elements: [{ type: 'mrkdwn', text: `Asked by <@${userId}> · ${modeIcon} ${mode} mode` }] },
+      ],
+    });
+
+    const threadTs = (parentRes as Record<string, unknown>).ts as string;
+    if (!threadTs) throw new Error('Failed to create thread — no ts returned from Slack');
+
+    // 2. Post "thinking" in thread
+    await slackPost('chat.postMessage', {
+      channel: channelId,
+      thread_ts: threadTs,
+      text: `${engine === 'nl-query' ? '💰' : '📊'} Analyzing your ${engineLabel(engine)} data…`,
+    });
+
+    // 3. Call engine with full Slack context
     const res = await fetch(`${SUPABASE_URL}/functions/v1/${engine}`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, user_id: userId, channel: channelId }),
+      body: JSON.stringify({
+        question,
+        user_id: userId,
+        channel: channelId,
+        mode,
+        slack_bot_token: SLACK_BOT_TOKEN,
+        slack_channel: channelId,
+        slack_thread_ts: threadTs,
+      }),
     });
 
     const data = await res.json();
@@ -108,34 +225,28 @@ async function processQuestion(
 
     const cmdDisplay = commandName !== '/ask' ? commandName : `/${engineLabel(engine)}`;
 
-    await fetch(responseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        response_type: 'in_channel',
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: `*Q:* _${question}_` } },
-          { type: 'divider' },
-          { type: 'section', text: { type: 'mrkdwn', text: data.answer } },
-          {
-            type: 'context',
-            elements: [{
-              type: 'mrkdwn',
-              text: `Asked by <@${userId}> via \`${cmdDisplay}\` · ${data.rows ?? 0} row${data.rows === 1 ? '' : 's'} · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s${data.model_used ? ` · ${formatModelName(data.model_used)}` : ''}`,
-            }],
-          },
-        ],
-        text: data.answer,
-      }),
+    // 4. Post answer in thread
+    await slackPost('chat.postMessage', {
+      channel: channelId,
+      thread_ts: threadTs,
+      text: data.answer,
+      blocks: [
+        { type: 'section', text: { type: 'mrkdwn', text: data.answer } },
+        { type: 'divider' },
+        {
+          type: 'context',
+          elements: [{
+            type: 'mrkdwn',
+            text: `via \`${cmdDisplay}\` · ${data.rows ?? 0} row${data.rows === 1 ? '' : 's'} · ${((data.duration_ms ?? 0) / 1000).toFixed(1)}s${data.model_used ? ` · ${formatModelName(data.model_used)}` : ''}`,
+          }],
+        },
+      ],
     });
   } catch (err) {
-    await fetch(responseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        response_type: 'ephemeral',
-        text: `❌ Sorry, I couldn't answer that: ${(err as Error).message}`,
-      }),
+    // Post error in channel (we may not have a thread)
+    await slackPost('chat.postMessage', {
+      channel: channelId,
+      text: `❌ Sorry, I couldn't answer that: ${(err as Error).message}`,
     });
   }
 }
