@@ -1,6 +1,6 @@
 import { loadTemplate, resolveParams, type FlowTemplate } from './template-loader.js';
 import { runDigest, type DigestChannel } from '../digest/index.js';
-import type { SenderConfig } from '../digest/senders.js';
+import { buildDigestConfig } from '../config.js';
 
 export interface ExecuteOptions {
   template_id: string;
@@ -69,18 +69,16 @@ async function executeDigest(
 ): Promise<unknown> {
   const channels = (params.channels as DigestChannel[]) ?? ['slack', 'email'];
 
-  const config: SenderConfig = {
-    slackAuthProvisionId:     process.env['SLACK_AUTH_PROVISION_ID']    || 'apn_P8hEEEa',
-    outlookAuthProvisionId:   process.env['OUTLOOK_AUTH_PROVISION_ID']  || 'apn_Xeh00n7',
-    slackChannelId:           (params.slack_channel_id as string)      || 'C0872NV9H43',
-    emailRecipients:          (params.email_recipients as string[])    || [],
-    emailSubjectPrefix:       (params.email_subject_prefix as string)  || 'Daily Revenue Tracker',
-    whatsappRecipients:       (params.whatsapp_recipients as string[]) || [],
-    whatsappTemplateSid:      (params.whatsapp_template_sid as string) || 'HX6f733603e2f8ffb785fcf131f872565a',
-    whatsappTemplateDelayMs:  (params.whatsapp_template_delay_ms as number) || 15_000,
-    twilioSid:                process.env['TWILIO_ACCOUNT_SID']        || '',
-    twilioToken:              process.env['TWILIO_AUTH_TOKEN']          || '',
-    twilioWaFrom:             process.env['TWILIO_WA_FROM']             || '',
+  // Start from env-sourced config then apply any template parameter overrides.
+  const base = buildDigestConfig();
+  const config = {
+    ...base,
+    slackChannelId:          (params.slack_channel_id as string)      || base.slackChannelId,
+    emailRecipients:         (params.email_recipients as string[])    || base.emailRecipients,
+    emailSubjectPrefix:      (params.email_subject_prefix as string)  || base.emailSubjectPrefix,
+    whatsappRecipients:      (params.whatsapp_recipients as string[]) || base.whatsappRecipients,
+    whatsappTemplateSid:     (params.whatsapp_template_sid as string) || base.whatsappTemplateSid,
+    whatsappTemplateDelayMs: (params.whatsapp_template_delay_ms as number) || base.whatsappTemplateDelayMs,
   };
 
   return runDigest({ dry_run: dryRun, channels }, config, supabaseUrl, supabaseKey, connect, userId);

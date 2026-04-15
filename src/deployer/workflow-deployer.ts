@@ -1,6 +1,7 @@
 import type { PipedreamRestClient } from '../clients/rest-api.js';
 import type { FlowTemplate } from '../engine/template-loader.js';
 import { loadTemplate, resolveParams } from '../engine/template-loader.js';
+import { TIMEOUTS } from '../config.js';
 
 export interface DeployResult {
   workflow_id: string;
@@ -53,14 +54,25 @@ export async function deployTemplateWorkflow(
   };
 }
 
+/**
+ * Build the Pipedream code step that POSTs to a webhook on each cron tick.
+ *
+ * The webhook URL is JSON-encoded before interpolation to prevent code
+ * injection if the URL contains quotes, backslashes, or other special chars.
+ */
 function buildCodeStep(template: FlowTemplate, webhookUrl: string) {
+  // JSON.stringify produces a properly-escaped JS string literal including the
+  // surrounding quotes, e.g. "https://example.com/path" → `"https://example.com/path"`.
+  const safeUrl = JSON.stringify(webhookUrl);
+  const safeId  = JSON.stringify(template.id);
+
   const code = `export default defineComponent({
   async run({ $ }) {
-    const res = await fetch("${webhookUrl}", {
+    const res = await fetch(${safeUrl}, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        template_id: "${template.id}",
+        template_id: ${safeId},
         source: "pipedream-cron",
         timestamp: new Date().toISOString(),
       }),
@@ -80,24 +92,36 @@ function buildCodeStep(template: FlowTemplate, webhookUrl: string) {
   };
 }
 
+/**
+ * Update the webhook URL (and optionally the template ID) of a previously
+ * deployed template workflow.
+ *
+ * @param templateId  - Optional: the template ID to embed in the POST body.
+ *                      Provide this so the receiving endpoint knows which
+ *                      template to run after the URL change.
+ */
 export async function updateWorkflowWebhook(
   workflowId: string,
   webhookUrl: string,
   rest: PipedreamRestClient,
+  templateId?: string,
 ): Promise<unknown> {
-  // Update the code step with the new webhook URL.
-  // We rebuild the step with the new URL and PATCH the workflow.
+  const safeUrl = JSON.stringify(webhookUrl);
+  const templateLine = templateId
+    ? `        template_id: ${JSON.stringify(templateId)},\n`
+    : '';
+
   return rest.updateWorkflow(workflowId, {
     steps: [{
       namespace: 'trigger_digest',
       type: 'CodeCell',
       code_raw: `export default defineComponent({
   async run({ $ }) {
-    const res = await fetch("${webhookUrl}", {
+    const res = await fetch(${safeUrl}, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        source: "pipedream-cron",
+${templateLine}        source: "pipedream-cron",
         timestamp: new Date().toISOString(),
       }),
     });
@@ -111,3 +135,7 @@ export async function updateWorkflowWebhook(
     }],
   });
 }
+
+// Re-export TIMEOUTS so callers that only import from this module don't need
+// a separate import when they want to pass a timeout to rest.updateWorkflow.
+export { TIMEOUTS };
