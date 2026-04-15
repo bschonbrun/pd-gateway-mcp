@@ -3,13 +3,18 @@
 // Usage: node scripts/deploy-edge.mjs <function-name> [function-name2 ...]
 
 import { readFileSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 
 const PROJECT_ID = 'iykqsdiochxtfrtmuzdr';
-const ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN;
+let ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN;
+if (!ACCESS_TOKEN) {
+  try { ACCESS_TOKEN = readFileSync(join(homedir(), '.supabase_token'), 'utf8').trim(); } catch { /* noop */ }
+}
 const FUNCTIONS_DIR = 'supabase/functions';
 
 if (!ACCESS_TOKEN) {
-  console.error('❌ Set SUPABASE_ACCESS_TOKEN env var');
+  console.error('❌ Set SUPABASE_ACCESS_TOKEN env var or create ~/.supabase_token');
   process.exit(1);
 }
 

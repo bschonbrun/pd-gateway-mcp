@@ -1,4 +1,4 @@
-// expense-query v55 — global + per-call timeouts
+// expense-query v56 — feedback loop: corrections injected into prompts
 // Normal: auto-resolve >= 0.8 confidence, ask user < 0.8
 // Training: auto-resolve >= 0.2 confidence, ask user < 0.2
 // Golden example matches = 100% confidence (always auto)
@@ -59,6 +59,7 @@ interface GoldenExample { question: string; correct_sql: string; }
 interface FinancialDefinition { term: string; category: string; definition: string; formula: string | null; sql_template: string | null; }
 interface KnowledgeTerm { term: string; standard_ref?: string; asc_code?: string; category: string; definition: string; guidance: string | null; example: string | null; }
 interface ConversationContext { question: string; sql: string; answer: string; }
+interface FeedbackRule { correction: string; feedback_type: string; question: string; created_at: string; }
 interface LLMResult { text: string; model: string; }
 
 // ─── SLACK PROGRESS ───
@@ -100,6 +101,24 @@ async function fetchKnowledgeTerms(url: string, key: string, table: 'gaap_terms'
 }
 async function fetchConversationContext(url: string, key: string, userId: string, channel: string): Promise<ConversationContext | null> {
   try { const res = await fetch(`${url}/rest/v1/expense_query_log?user_id=eq.${encodeURIComponent(userId)}&channel=eq.${encodeURIComponent(channel)}&generated_sql=not.is.null&error=is.null&order=created_at.desc&limit=1&select=question,generated_sql,answer`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows.length ? { question: rows[0].question, sql: rows[0].generated_sql, answer: rows[0].answer } : null; } catch { return null; }
+}
+async function fetchRecentFeedback(url: string, key: string, limit = 20): Promise<FeedbackRule[]> {
+  try {
+    const res = await fetch(`${url}/rest/v1/expense_query_feedback?select=correction,feedback_type,created_at,log_id&order=created_at.desc&limit=${limit}`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } });
+    if (!res.ok) return [];
+    const rows = await res.json() as { correction: string; feedback_type: string; created_at: string; log_id: string }[];
+    // Enrich with original question from log
+    const logIds = [...new Set(rows.map(r => r.log_id).filter(Boolean))];
+    const questionsMap = new Map<string, string>();
+    if (logIds.length > 0) {
+      const logRes = await fetch(`${url}/rest/v1/expense_query_log?id=in.(${logIds.map(id => `"${id}"`).join(',')})&select=id,question`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } });
+      if (logRes.ok) {
+        const logs = await logRes.json() as { id: string; question: string }[];
+        for (const log of logs) questionsMap.set(log.id, log.question);
+      }
+    }
+    return rows.map(r => ({ correction: r.correction, feedback_type: r.feedback_type, question: questionsMap.get(r.log_id) ?? '', created_at: r.created_at }));
+  } catch { return []; }
 }
 
 // ─── MODE MANAGEMENT ───
@@ -286,7 +305,35 @@ function buildKnowledgeAnswer(question: string, terms: KnowledgeTerm[], standard
   return out;
 }
 
-function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[]): string {
+function buildFeedbackContext(feedback: FeedbackRule[]): string {
+  if (!feedback.length) return '';
+  const sqlCorrections = feedback.filter(f => f.feedback_type === 'wrong').slice(0, 5);
+  const teachRules = feedback.filter(f => f.feedback_type === 'teach' || f.feedback_type === 'learn').slice(0, 10);
+  const parts: string[] = [];
+  if (teachRules.length) {
+    parts.push('## USER-TAUGHT RULES — YOU MUST FOLLOW THESE\n' +
+      teachRules.map(r => `- ${r.correction}${r.question ? ` (context: "${r.question}")` : ''}`).join('\n'));
+  }
+  if (sqlCorrections.length) {
+    parts.push('## PAST CORRECTIONS — LEARN FROM THESE MISTAKES\n' +
+      sqlCorrections.map(r => `- User said: "${r.correction}"${r.question ? ` (about: "${r.question}")` : ''}`).join('\n'));
+  }
+  return parts.join('\n\n');
+}
+
+function buildFormatPromptWithFeedback(feedback: FeedbackRule[]): string {
+  let prompt = FORMAT_SYSTEM_PROMPT;
+  const formatRules = feedback.filter(f =>
+    /\b(format|display|show|express|unit|currency|days|\$|USD|comma|decimal|label|confus)\b/i.test(f.correction)
+  ).slice(0, 5);
+  if (formatRules.length) {
+    prompt += '\n\n## USER FORMATTING RULES — MANDATORY\n' +
+      formatRules.map(r => `- ${r.correction}`).join('\n');
+  }
+  return prompt;
+}
+
+function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[], feedback?: FeedbackRule[]): string {
   let prompt = basePrompt;
   if (relevantDefs.length > 0) {
     const defsBlock = relevantDefs.map(d => { let e = `TERM: ${d.term} (${d.category})\nDEFINITION: ${d.definition}`; if (d.formula) e += `\nFORMULA: ${d.formula}`; if (d.sql_template) e += `\nSQL PATTERN: ${d.sql_template}`; return e; }).join('\n\n');
@@ -297,6 +344,9 @@ function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], r
   }
   if (examples.length > 0) {
     prompt += `\n\nGOLDEN EXAMPLES:\n\n${examples.map(e => `Q: ${e.question}\nA: ${e.correct_sql}`).join('\n\n')}`;
+  }
+  if (feedback?.length) {
+    prompt += `\n\n${buildFeedbackContext(feedback)}`;
   }
   return prompt;
 }
@@ -722,24 +772,64 @@ Deno.serve(async (req: Request) => {
   if (FEEDBACK_PATTERNS.test(question)) {
     const match = question.match(/^\s*(?:\/)?(wrong|learn|teach)[:\s]\s*([\s\S]+)/i);
     if (match) {
+      const feedbackType = match[1].toLowerCase();
       const correctionText = match[2].trim();
       const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
       if (!recent) return Response.json({ answer: 'Ask a question first.' });
       await progress('📝 Recording correction...');
-      await writeFeedback(supabaseUrl, supabaseKey, { log_id: recent.id, slack_user: user_id, rating: 'negative', correction: correctionText, feedback_type: match[1].toLowerCase() });
-      await progress('🔧 Generating corrected SQL...');
-      const [examples, allDefs] = await Promise.all([fetchGoldenExamples(supabaseUrl, supabaseKey), fetchFinancialDefinitions(supabaseUrl, supabaseKey)]);
-      const relevantDefs = matchRelevantDefinitions(recent.question, allDefs);
-      const diagnosisPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs);
-      let correctedAnswer = '', verifiedSql = '';
-      try {
-        const sqlResult = await callLLM(diagnosisPrompt, `Previous SQL wrong.\nQ: "${recent.question}"\nSQL: ${recent.generated_sql}\nCorrection: "${correctionText}"\nGenerate CORRECTED SQL only.`, anthropicKey, geminiKey, 1024, true);
-        const sql = cleanSQL(sqlResult.text);
-        if (validateSQL(sql).valid) { await progress('⚡ Running corrected query...'); const result = await executeQuery(sql, supabaseUrl, supabaseKey); verifiedSql = sql; const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${recent.question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 512); correctedAnswer = fmt.text; }
-      } catch { /* best-effort */ }
-      if (verifiedSql) await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, verifiedSql, `Correction: ${correctionText}`);
+      await writeFeedback(supabaseUrl, supabaseKey, { log_id: recent.id, slack_user: user_id, rating: 'negative', correction: correctionText, feedback_type: feedbackType });
+
+      // Determine if this is a SQL correction or a formatting/behavior rule
+      const isSQLCorrection = /\b(sql|query|table|column|join|where|from|select|group|order|sum|count|avg|having|distinct|subquery|GL|journals?|invoices?|bills?)\b/i.test(correctionText);
+
+      if (isSQLCorrection && recent.generated_sql) {
+        await progress('🔧 Generating corrected SQL...');
+        const [examples, allDefs, priorFeedback] = await Promise.all([
+          fetchGoldenExamples(supabaseUrl, supabaseKey),
+          fetchFinancialDefinitions(supabaseUrl, supabaseKey),
+          fetchRecentFeedback(supabaseUrl, supabaseKey),
+        ]);
+        const relevantDefs = matchRelevantDefinitions(recent.question, allDefs);
+        const diagnosisPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, undefined, priorFeedback);
+        let correctedAnswer = '', verifiedSql = '';
+        try {
+          const sqlResult = await callLLM(diagnosisPrompt, `Previous SQL wrong.\nQ: "${recent.question}"\nSQL: ${recent.generated_sql}\nCorrection: "${correctionText}"\nGenerate CORRECTED SQL only.`, anthropicKey, geminiKey, 1024, true);
+          const sql = cleanSQL(sqlResult.text);
+          if (validateSQL(sql).valid) {
+            await progress('⚡ Running corrected query...');
+            const result = await executeQuery(sql, supabaseUrl, supabaseKey);
+            verifiedSql = sql;
+            const fmtPrompt = buildFormatPromptWithFeedback(priorFeedback);
+            const fmt = await callLLM(fmtPrompt, `Q: ${recent.question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}`, anthropicKey, geminiKey, 512);
+            correctedAnswer = fmt.text;
+          }
+        } catch { /* best-effort */ }
+        if (verifiedSql) await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, verifiedSql, `Correction: ${correctionText}`);
+        await deleteSlackProgress(slack_bot_token, slack_channel);
+        const fullAnswer = correctedAnswer
+          ? `📝 *Correction for:* _"${recent.question}"_\nNote: _${correctionText}_\n\n---\n*Updated:*\n${correctedAnswer}\n\n_✅ Verified SQL saved._`
+          : `📝 *Recorded SQL correction:* _${correctionText}_\n⚠️ Could not auto-generate corrected SQL. I'll remember this rule for next time.`;
+        await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, answer: fullAnswer, duration_ms: ms() });
+        return Response.json({ answer: fullAnswer, duration_ms: ms() });
+      }
+
+      // Non-SQL correction: formatting, behavior, or response quality feedback
+      // Re-run the same query with the correction applied to see if it improves
+      await progress('🔧 Applying correction...');
+      let correctedAnswer = '';
+      if (recent.generated_sql) {
+        try {
+          const result = await executeQuery(recent.generated_sql, supabaseUrl, supabaseKey);
+          const priorFeedback = await fetchRecentFeedback(supabaseUrl, supabaseKey);
+          const fmtPrompt = buildFormatPromptWithFeedback(priorFeedback);
+          const fmt = await callLLM(fmtPrompt, `Q: ${recent.question}\nResults (${result.rows.length}):\n${JSON.stringify(result.rows.slice(0, 50))}\n\nIMPORTANT USER CORRECTION: "${correctionText}"\nYou MUST apply this correction to how you format and present the answer.`, anthropicKey, geminiKey, 512);
+          correctedAnswer = fmt.text;
+        } catch { /* best-effort */ }
+      }
       await deleteSlackProgress(slack_bot_token, slack_channel);
-      const fullAnswer = correctedAnswer ? `📝 *Correction for:* _"${recent.question}"_\nNote: _${correctionText}_\n\n---\n*Updated:*\n${correctedAnswer}\n\n_✅ Verified SQL saved._` : `📝 *Recorded:* _${correctionText}_\nApplying going forward. 🙏`;
+      const fullAnswer = correctedAnswer
+        ? `📝 *Correction for:* _"${recent.question}"_\nRule: _${correctionText}_\n\n---\n*Updated:*\n${correctedAnswer}\n\n_✅ Rule saved — I'll apply this to future answers._`
+        : `📝 *Rule saved:* _${correctionText}_\n✅ I'll apply this to all future answers.`;
       await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, answer: fullAnswer, duration_ms: ms() });
       return Response.json({ answer: fullAnswer, duration_ms: ms() });
     }
@@ -769,10 +859,11 @@ Deno.serve(async (req: Request) => {
   // ── SQL QUERY MODE — CONFIDENCE-BASED PIPELINE
   await progress('⏳ Understanding your question...');
 
-  const [examples, allDefinitions, priorContext] = await Promise.all([
+  const [examples, allDefinitions, priorContext, userFeedback] = await Promise.all([
     fetchGoldenExamples(supabaseUrl, supabaseKey),
     fetchFinancialDefinitions(supabaseUrl, supabaseKey),
     fetchConversationContext(supabaseUrl, supabaseKey, user_id, channel),
+    fetchRecentFeedback(supabaseUrl, supabaseKey),
   ]);
 
   // ── GOLDEN MATCH CHECK (100% confidence — skip everything)
@@ -884,7 +975,7 @@ Deno.serve(async (req: Request) => {
   }
 
   const relevantDefs = matchRelevantDefinitions(thread_context ? `${thread_context} ${question}` : question, allDefinitions);
-  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs);
+  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs, userFeedback);
 
   await progress('⚡ Generating SQL...');
   const complex = isComplexQuery(question);
@@ -978,7 +1069,7 @@ Deno.serve(async (req: Request) => {
   let answer: string;
   const simple = templateSimpleAnswer(question, rows);
   if (simple) answer = simple;
-  else { try { const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, `Q: ${question}\nResults (${rows.length}):\n${JSON.stringify(rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024); answer = fmt.text; } catch { answer = formatFallback(question, rows); } }
+  else { try { const fmtPrompt = buildFormatPromptWithFeedback(userFeedback); const fmt = await callLLM(fmtPrompt, `Q: ${question}\nResults (${rows.length}):\n${JSON.stringify(rows.slice(0, 50))}`, anthropicKey, geminiKey, 1024); answer = fmt.text; } catch { answer = formatFallback(question, rows); } }
 
   // Prepend mode badge
   const modeBadge = mode === 'training' ? '🎓 ' : '';

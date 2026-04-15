@@ -215,6 +215,18 @@ function buildDrilldownButtons(
       action_id: 'drilldown_audit',
       value,
     });
+
+    // Add Resolve button when audit found issues
+    const auditIssues = (meta.audit as Record<string, unknown>).issues as string;
+    if (auditIssues && auditIssues !== 'none' && confPct < 70) {
+      elements.push({
+        type: 'button',
+        text: { type: 'plain_text', text: '🔧 Resolve', emoji: true },
+        style: 'danger',
+        action_id: 'drilldown_resolve',
+        value,
+      });
+    }
   }
 
   return elements.length ? [{ type: 'actions', elements }] : [];
@@ -273,8 +285,31 @@ async function processAndThread(
       ? buildDrilldownButtons(channelId, threadTs, engine, data.transparency_meta ?? null)
       : [];
 
+    // Slack section text limit = 3000 chars; truncate to ensure buttons render
+    const MAX_BLOCK_TEXT = 2900;
+    const answerText = data.answer as string;
+    const answerBlocks: Record<string, unknown>[] = [];
+    if (answerText.length <= MAX_BLOCK_TEXT) {
+      answerBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: answerText } });
+    } else {
+      // Split into multiple section blocks at paragraph boundaries
+      let remaining = answerText;
+      while (remaining.length > 0) {
+        if (remaining.length <= MAX_BLOCK_TEXT) {
+          answerBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining } });
+          break;
+        }
+        const chunk = remaining.substring(0, MAX_BLOCK_TEXT);
+        const splitAt = chunk.lastIndexOf('\n\n');
+        const boundary = splitAt > MAX_BLOCK_TEXT * 0.3 ? splitAt : chunk.lastIndexOf('\n');
+        const cutAt = boundary > MAX_BLOCK_TEXT * 0.3 ? boundary : MAX_BLOCK_TEXT;
+        answerBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: remaining.substring(0, cutAt) } });
+        remaining = remaining.substring(cutAt).trimStart();
+      }
+    }
+
     const blocks: Record<string, unknown>[] = [
-      { type: 'section', text: { type: 'mrkdwn', text: data.answer } },
+      ...answerBlocks,
       ...drilldownBlocks,
       { type: 'divider' },
       {
