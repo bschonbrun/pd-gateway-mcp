@@ -163,8 +163,7 @@ function handleInteraction(payload: Record<string, unknown>): Response {
       question: string; channelId: string; commandName: string; engine: Engine;
     };
     processAndThread(question, userId, channelId, commandName, engine, mode);
-    const modeLabel = mode === 'training' ? '🎓 Training' : '⚡ Normal';
-    return jsonResponse({ response_type: 'ephemeral', replace_original: true, text: `${modeLabel} mode — processing your query…` });
+    return jsonResponse({ delete_original: true });
   }
 
   // Drill-down buttons (definitions, interpretation, audit)
