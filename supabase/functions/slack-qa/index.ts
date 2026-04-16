@@ -66,6 +66,38 @@ async function slackPost(method: string, body: Record<string, unknown>): Promise
 Deno.serve(async (req: Request) => {
   const contentType = req.headers.get('content-type') ?? '';
 
+  // ── JSON body (Event API: app_mention, message) ────────────────────────
+  if (contentType.includes('application/json')) {
+    const body = await req.json();
+
+    // Slack URL verification challenge
+    if (body.type === 'url_verification') {
+      return new Response(JSON.stringify({ challenge: body.challenge }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Event callback (app_mention in thread = follow-up)
+    if (body.type === 'event_callback' && body.event) {
+      const event = body.event;
+      // Only handle app_mention or direct messages in threads
+      if ((event.type === 'app_mention' || event.type === 'message') && event.thread_ts) {
+        // Don't respond to bot's own messages
+        if (event.bot_id || event.subtype === 'bot_message') {
+          return new Response('OK', { status: 200 });
+        }
+        const followUp = (event.text as string ?? '').replace(/<@[A-Z0-9]+>/g, '').trim();
+        const userId = event.user as string;
+        const channelId = event.channel as string;
+        const threadTs = event.thread_ts as string;
+
+        if (followUp) {
+          handleThreadFollowUp(followUp, userId, channelId, threadTs);
+        }
+        return new Response('OK', { status: 200 });
+      }
+      return new Response('OK', { status: 200 });
+    }
+  }
+
   // ── Interactive callback (button click) ──────────────────────────────────
   if (contentType.includes('application/x-www-form-urlencoded')) {
     const formData = await req.formData();
@@ -291,6 +323,62 @@ async function callEngine(
     await slackPost('chat.postMessage', { channel: channelId, thread_ts: threadTs, blocks, text: answerText.slice(0, 200) });
   } catch (err) {
     await slackPost('chat.postMessage', { channel: channelId, thread_ts: threadTs, text: `❌ Error: ${err instanceof Error ? err.message : 'Unknown error'}` });
+  }
+}
+
+// ─── THREAD FOLLOW-UP ──────────────────────────────────────────────────────────
+async function handleThreadFollowUp(
+  followUp: string, userId: string, channelId: string, threadTs: string,
+): Promise<void> {
+  try {
+    // Fetch thread history to find the original question and last bot answer
+    const historyRes = await slackPost('conversations.replies', { channel: channelId, ts: threadTs, limit: 20 });
+    const messages = (historyRes.messages ?? []) as Array<Record<string, unknown>>;
+
+    // Find the original question (first message, usually "Q: ...")
+    const parentMsg = messages[0];
+    const originalQ = ((parentMsg?.text as string) ?? '').replace(/^Q:\s*/i, '').replace(/\s*\(.*\)\s*$/, '').trim();
+
+    // Find the last bot answer (longest bot message, likely the data response)
+    const botMessages = messages.filter(m => m.bot_id && !m.subtype && (m.text as string)?.length > 50);
+    const lastBotAnswer = botMessages.length > 0
+      ? (botMessages[botMessages.length - 1].text as string).slice(0, 2000)
+      : '';
+
+    // Post "thinking" message
+    await slackPost('chat.postMessage', {
+      channel: channelId, thread_ts: threadTs,
+      text: '🔄 Processing your follow-up…',
+    });
+
+    // Call engine with thread context
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/expense-query`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question: followUp,
+        user_id: userId,
+        channel: channelId,
+        mode: 'normal',
+        slack_bot_token: SLACK_BOT_TOKEN,
+        slack_channel: channelId,
+        slack_thread_ts: threadTs,
+        thread_context: `Q: ${originalQ}\nAnswer: ${lastBotAnswer}`,
+      }),
+    });
+
+    const data = await res.json();
+    const answerText = (data.answer as string) ?? 'No response from engine.';
+
+    await slackPost('chat.postMessage', {
+      channel: channelId, thread_ts: threadTs,
+      text: answerText.slice(0, 3000),
+    });
+  } catch (err) {
+    await slackPost('chat.postMessage', {
+      channel: channelId, thread_ts: threadTs,
+      text: `❌ Follow-up error: ${err instanceof Error ? err.message : 'Unknown error'}`,
+    });
   }
 }
 

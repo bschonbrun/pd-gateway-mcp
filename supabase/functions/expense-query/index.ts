@@ -699,6 +699,17 @@ Deno.serve(async (req: Request) => {
 
   if (HELP_PATTERNS.test(question)) return Response.json({ answer: DATA_SUMMARY, duration_ms: ms() });
 
+  // ── Reformat shortcut: formatting-only follow-ups in thread context ──
+  const REFORMAT_PATTERNS = /\b(table|format|sort|top \d+|bottom \d+|chart|pie|bar|graph|as a (table|list|chart)|show (only|just|top|bottom)|order by|rank|reformat|summarize|shorter|condense)\b/i;
+  if (thread_context && REFORMAT_PATTERNS.test(question)) {
+    await progress('🔄 Reformatting…');
+    const reformatPrompt = `The user already has this data and wants it reformatted. Apply their formatting request to the existing data.\n\nPrevious answer:\n${thread_context}\n\nUser request: "${question}"\n\nReformat the data according to their request. Use Slack mrkdwn. For tables, use code blocks with aligned columns.`;
+    const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, reformatPrompt, anthropicKey, geminiKey, 2048);
+    await deleteSlackProgress(slack_bot_token, slack_channel);
+    return Response.json({ answer: fmt.text, duration_ms: ms() });
+  }
+
+
   if (DEBUG_PATTERNS.test(question)) {
     const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
     if (!recent) return Response.json({ answer: 'No recent query to debug.' });
