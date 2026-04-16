@@ -62,13 +62,50 @@ async function slackPost(method: string, body: Record<string, unknown>): Promise
   return res.json() as Promise<Record<string, unknown>>;
 }
 
+// ─── SLACK SIGNATURE VERIFICATION ─────────────────────────────────────────────
+// Validates X-Slack-Signature to prevent forged requests.
+async function verifySlackSignature(req: Request, rawBody: string): Promise<boolean> {
+  const secret = SLACK_SIGNING_SECRET;
+  if (!secret) return true; // not configured → skip (dev environments)
+
+  const timestamp = req.headers.get('x-slack-request-timestamp') ?? '';
+  const sig = req.headers.get('x-slack-signature') ?? '';
+  if (!timestamp || !sig) return false;
+
+  // Reject replays older than 5 minutes
+  if (Math.abs(Date.now() / 1000 - parseInt(timestamp, 10)) > 300) return false;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(`v0:${timestamp}:${rawBody}`));
+  const hex = Array.from(new Uint8Array(mac)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return `v0=${hex}` === sig;
+}
+
 // ─── MAIN HANDLER ──────────────────────────────────────────────────────────────
 Deno.serve(async (req: Request) => {
+  if (req.method !== 'POST' && req.method !== 'OPTIONS') return new Response('Method not allowed', { status: 405 });
+
+  // Read raw body once — needed for signature verification before parsing.
+  const rawBody = await req.text();
   const contentType = req.headers.get('content-type') ?? '';
+
+  // Verify Slack signature on all incoming requests (skip OPTIONS / URL verification)
+  if (req.method === 'POST') {
+    // URL verification challenge doesn't need HMAC since it's the initial handshake
+    const isUrlVerification = contentType.includes('application/json') && rawBody.includes('"url_verification"');
+    if (!isUrlVerification && SLACK_SIGNING_SECRET) {
+      if (!(await verifySlackSignature(req, rawBody))) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+    }
+  }
 
   // ── JSON body (Event API: app_mention, message) ────────────────────────
   if (contentType.includes('application/json')) {
-    const body = await req.json();
+    const body = JSON.parse(rawBody);
 
     // Slack URL verification challenge
     if (body.type === 'url_verification') {
@@ -100,22 +137,23 @@ Deno.serve(async (req: Request) => {
 
   // ── Interactive callback (button click) ──────────────────────────────────
   if (contentType.includes('application/x-www-form-urlencoded')) {
-    const formData = await req.formData();
-    const payloadStr = formData.get('payload') as string | null;
+    // Parse from rawBody (body stream already consumed by req.text() above)
+    const params = new URLSearchParams(rawBody);
+    const payloadStr = params.get('payload');
 
     if (payloadStr) {
       return handleInteraction(JSON.parse(payloadStr));
     }
 
     // ── Slash command ──────────────────────────────────────────────────────
-    return handleSlashCommand(formData);
+    return handleSlashCommand(params);
   }
 
   return new Response('Unsupported', { status: 400 });
 });
 
 // ─── SLASH COMMAND ─────────────────────────────────────────────────────────────
-async function handleSlashCommand(formData: FormData): Promise<Response> {
+async function handleSlashCommand(formData: URLSearchParams): Promise<Response> {
   const question = (formData.get('text') as string)?.trim();
   const userId = formData.get('user_id') as string;
   const channelId = formData.get('channel_id') as string;
