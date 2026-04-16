@@ -155,6 +155,7 @@ function handleInteraction(payload: Record<string, unknown>): Response {
   const action = actions[0];
   const actionId = action.action_id as string;
   const userId = ((payload.user as Record<string, unknown>)?.id as string) ?? 'unknown';
+  const responseUrl = payload.response_url as string | undefined;
 
   // Mode picker buttons
   if (actionId.startsWith('mode_')) {
@@ -163,6 +164,10 @@ function handleInteraction(payload: Record<string, unknown>): Response {
       question: string; channelId: string; commandName: string; engine: Engine;
     };
     processAndThread(question, userId, channelId, commandName, engine, mode);
+    // Delete the ephemeral mode picker via response_url
+    if (responseUrl) {
+      fetch(responseUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ delete_original: true }) }).catch(() => {});
+    }
     return jsonResponse({ delete_original: true });
   }
 
