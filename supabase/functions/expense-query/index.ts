@@ -459,7 +459,19 @@ Rules:
   - Percentage: "*23.4%*"
 - ALWAYS provide brief context (e.g. "Your current DSO is *54.3 days*")
 - Keep it concise — one or two sentences for simple metrics
-- For tables, use bullet points with labels
+
+TABLE FORMATTING — for results with 3+ rows:
+- Use a code block with aligned columns for readability
+- Example format:
+\`\`\`
+Customer          Revenue      Orders  Totes
+XRI               $243,345      11     156.4
+Aureus            $242,675       9     128.9
+Renda              $80,655       3      21.9
+\`\`\`
+- Right-align numbers, left-align text
+- Keep column headers short and clear
+- Always add a summary line above or below the table (e.g. "Total: $822,183 across 52 orders")
 
 METHODOLOGY TRANSPARENCY — for any calculated ratio or KPI (DSO, DPO, margins, turnover, ratios, growth rates, etc.):
 - State the formula used in plain English, e.g. "_(AR Balance ÷ Revenue over 90 days) × 90_"
