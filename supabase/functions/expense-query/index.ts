@@ -60,28 +60,48 @@ interface FinancialDefinition { term: string; category: string; definition: stri
 interface KnowledgeTerm { term: string; standard_ref?: string; asc_code?: string; category: string; definition: string; guidance: string | null; example: string | null; }
 interface ConversationContext { question: string; sql: string; answer: string; }
 interface FeedbackRule { correction: string; feedback_type: string; question: string; created_at: string; }
+interface SchemaHint { category: string; hint: string; }
 interface LLMResult { text: string; model: string; }
 
 // ─── SLACK PROGRESS ───
+// Stateless: callers own the ts ref so concurrent requests never share state.
 
-let _progressMsgTs: string | null = null;
-
-async function updateSlackProgress(botToken: string | undefined, channel: string | undefined, threadTs: string | undefined, text: string): Promise<void> {
-  if (!botToken || !channel || !threadTs) return;
+async function updateSlackProgress(
+  botToken: string | undefined, channel: string | undefined,
+  threadTs: string | undefined, text: string, currentTs: string | null,
+): Promise<string | null> {
+  if (!botToken || !channel || !threadTs) return currentTs;
   try {
-    if (!_progressMsgTs) {
-      const res = await fetch('https://slack.com/api/chat.postMessage', { method: 'POST', headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, thread_ts: threadTs, text }) });
-      const data = await res.json(); if (data.ok) _progressMsgTs = data.ts;
+    if (!currentTs) {
+      const res = await fetch('https://slack.com/api/chat.postMessage', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel, thread_ts: threadTs, text }),
+      });
+      const data = await res.json();
+      return data.ok ? (data.ts as string) : null;
     } else {
-      await fetch('https://slack.com/api/chat.update', { method: 'POST', headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, ts: _progressMsgTs, text }) });
+      await fetch('https://slack.com/api/chat.update', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel, ts: currentTs, text }),
+      });
+      return currentTs;
     }
-  } catch { /* best-effort */ }
+  } catch { return currentTs; }
 }
 
-async function deleteSlackProgress(botToken: string | undefined, channel: string | undefined): Promise<void> {
-  if (!botToken || !channel || !_progressMsgTs) return;
-  try { await fetch('https://slack.com/api/chat.delete', { method: 'POST', headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel, ts: _progressMsgTs }) }); } catch { /* cleanup */ }
-  _progressMsgTs = null;
+async function deleteSlackProgress(
+  botToken: string | undefined, channel: string | undefined, currentTs: string | null,
+): Promise<void> {
+  if (!botToken || !channel || !currentTs) return;
+  try {
+    await fetch('https://slack.com/api/chat.delete', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${botToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel, ts: currentTs }),
+    });
+  } catch { /* cleanup */ }
 }
 
 // ─── DATA FETCHERS ───
@@ -102,6 +122,22 @@ async function fetchKnowledgeTerms(url: string, key: string, table: 'gaap_terms'
 async function fetchConversationContext(url: string, key: string, userId: string, channel: string): Promise<ConversationContext | null> {
   try { const res = await fetch(`${url}/rest/v1/expense_query_log?user_id=eq.${encodeURIComponent(userId)}&channel=eq.${encodeURIComponent(channel)}&generated_sql=not.is.null&error=is.null&order=created_at.desc&limit=1&select=question,generated_sql,answer`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows.length ? { question: rows[0].question, sql: rows[0].generated_sql, answer: rows[0].answer } : null; } catch { return null; }
 }
+// Schema hints: learned rules injected into the SQL system prompt.
+// Capped at 20 per domain; both verified and auto-generated hints are used.
+let _hintCache: { ts: number; data: SchemaHint[] } | null = null;
+async function fetchSchemaHints(url: string, key: string, domain: 'finance' | 'revenue'): Promise<SchemaHint[]> {
+  if (_hintCache && Date.now() - _hintCache.ts < 5 * 60 * 1000) return _hintCache.data;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/schema_hints?domain=eq.${domain}&select=category,hint&order=verified.desc,created_at.desc&limit=20`,
+      { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }
+    );
+    const data: SchemaHint[] = res.ok ? await res.json() : [];
+    _hintCache = { ts: Date.now(), data };
+    return data;
+  } catch { return []; }
+}
+
 async function fetchRecentFeedback(url: string, key: string, limit = 20): Promise<FeedbackRule[]> {
   try {
     const res = await fetch(`${url}/rest/v1/expense_query_feedback?select=correction,feedback_type,created_at,log_id&order=created_at.desc&limit=${limit}`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } });
@@ -333,8 +369,11 @@ function buildFormatPromptWithFeedback(feedback: FeedbackRule[]): string {
   return prompt;
 }
 
-function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[], feedback?: FeedbackRule[]): string {
+function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[], feedback?: FeedbackRule[], schemaHints?: SchemaHint[]): string {
   let prompt = basePrompt;
+  if (schemaHints && schemaHints.length > 0) {
+    prompt += `\n\n## LEARNED RULES — FOLLOW THESE EXACTLY\n${schemaHints.map(h => `- ${h.hint}`).join('\n')}`;
+  }
   if (relevantDefs.length > 0) {
     const defsBlock = relevantDefs.map(d => { let e = `TERM: ${d.term} (${d.category})\nDEFINITION: ${d.definition}`; if (d.formula) e += `\nFORMULA: ${d.formula}`; if (d.sql_template) e += `\nSQL PATTERN: ${d.sql_template}`; return e; }).join('\n\n');
     prompt += `\n\n## RELEVANT FINANCIAL DEFINITIONS — MANDATORY\n${defsBlock}`;
@@ -620,7 +659,7 @@ function buildTransparency(mode: 'normal' | 'training', opts: { defsUsed: Financ
 
 async function logQuery(url: string, key: string, entry: Record<string, unknown>): Promise<string | null> { try { const res = await fetch(`${url}/rest/v1/expense_query_log`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' }, body: JSON.stringify(entry) }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0]?.id ?? null; } catch { return null; } }
 async function writeFeedback(url: string, key: string, entry: Record<string, unknown>): Promise<boolean> { try { const res = await fetch(`${url}/rest/v1/expense_query_feedback`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify(entry) }); return res.ok; } catch { return false; } }
-async function findMostRecentLog(url: string, key: string, userId: string): Promise<{ id: string; question: string; generated_sql: string; transparency_meta?: TransparencyMeta } | null> { try { const res = await fetch(`${url}/rest/v1/expense_query_log?user_id=eq.${userId}&select=id,question,generated_sql,transparency_meta&order=created_at.desc&limit=1`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0] ?? null; } catch { return null; } }
+async function findMostRecentLog(url: string, key: string, userId: string): Promise<{ id: string; question: string; generated_sql: string; transparency_meta?: TransparencyMeta } | null> { try { const res = await fetch(`${url}/rest/v1/expense_query_log?user_id=eq.${encodeURIComponent(userId)}&select=id,question,generated_sql,transparency_meta&order=created_at.desc&limit=1`, { headers: { 'apikey': key, 'Authorization': `Bearer ${key}` } }); if (!res.ok) return null; const rows = await res.json(); return rows?.[0] ?? null; } catch { return null; } }
 async function saveVerifiedGolden(url: string, key: string, question: string, verifiedSql: string, notes: string): Promise<void> { try { await fetch(`${url}/rest/v1/expense_query_golden`, { method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }, body: JSON.stringify({ question, correct_sql: verifiedSql, notes, approved: true, promoted: true }) }); } catch { /* best-effort */ } }
 
 // ─── PERPLEXITY RESEARCH ───
@@ -635,7 +674,6 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type' } });
   if (req.method !== 'POST') return Response.json({ error: 'POST only' }, { status: 405 });
 
-  _progressMsgTs = null;
   const startMs = Date.now();
   const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
   const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -653,7 +691,16 @@ Deno.serve(async (req: Request) => {
 
   const ms = () => Date.now() - startMs;
   const isOverDeadline = () => ms() > GLOBAL_TIMEOUT_MS;
-  const progress = (text: string) => updateSlackProgress(slack_bot_token, slack_channel, slack_thread_ts, text);
+
+  // Per-request progress ts — no shared module state, safe for concurrent requests
+  let _progressTs: string | null = null;
+  const progress = async (text: string) => {
+    _progressTs = await updateSlackProgress(slack_bot_token, slack_channel, slack_thread_ts, text, _progressTs);
+  };
+  const deleteProgress = async () => {
+    await deleteSlackProgress(slack_bot_token, slack_channel, _progressTs);
+    _progressTs = null;
+  };
 
   let mode: 'normal' | 'training' = body.mode ?? 'normal';
   if (!body.mode) mode = await getUserMode(supabaseUrl, supabaseKey, user_id);
@@ -705,7 +752,7 @@ Deno.serve(async (req: Request) => {
     await progress('🔄 Reformatting…');
     const reformatPrompt = `The user already has this data and wants it reformatted. Apply their formatting request to the existing data.\n\nPrevious answer:\n${thread_context}\n\nUser request: "${question}"\n\nReformat the data according to their request. Use Slack mrkdwn. For tables, use code blocks with aligned columns.`;
     const fmt = await callLLM(FORMAT_SYSTEM_PROMPT, reformatPrompt, anthropicKey, geminiKey, 2048);
-    await deleteSlackProgress(slack_bot_token, slack_channel);
+    await deleteProgress();
     return Response.json({ answer: fmt.text, duration_ms: ms() });
   }
 
@@ -828,11 +875,11 @@ Deno.serve(async (req: Request) => {
         await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, newSql, usedTemplate ? `Resolved via definition template: ${templateDef!.term}` : `Auto-resolved from audit issues: ${meta.audit.issues}`);
       }
 
-      await deleteSlackProgress(slack_bot_token, slack_channel);
+      await deleteProgress();
       const statusLine = (usedTemplate || reauditPassed) ? '✅ *Resolved and saved as verified answer.*' : '⚠️ *Resolved but re-audit had concerns — not saved as golden.*';
       return Response.json({ answer: `🔧 *Resolved:* _"${recent.question}"_\n\n${fmt.text}\n\n${statusLine}\n_The corrected SQL now uses the proper formula from your definitions._` });
     } catch (e) {
-      await deleteSlackProgress(slack_bot_token, slack_channel);
+      await deleteProgress();
       return Response.json({ answer: `❌ Resolve failed: ${(e as Error).message}\n\nPlease use \`wrong: [your correction]\` to teach me manually.` });
     }
   }
@@ -846,6 +893,20 @@ Deno.serve(async (req: Request) => {
       if (!recent) return Response.json({ answer: 'Ask a question first.' });
       await progress('📝 Recording correction...');
       await writeFeedback(supabaseUrl, supabaseKey, { log_id: recent.id, slack_user: user_id, rating: 'negative', correction: correctionText, feedback_type: feedbackType });
+
+      // Fire-and-forget: review agent classifies root cause + saves schema hint
+      // Posts its own Slack message to the thread with the diagnosis
+      if (feedbackType === 'wrong' && recent.generated_sql) {
+        fetch(`${supabaseUrl}/functions/v1/review-agent`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${supabaseKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question: recent.question, sql: recent.generated_sql,
+            correction: correctionText, domain: 'finance', log_id: recent.id,
+            slack_channel, slack_thread_ts,
+          }),
+        }).catch(() => {});
+      }
 
       // Determine if this is a SQL correction or a formatting/behavior rule
       const isSQLCorrection = /\b(sql|query|table|column|join|where|from|select|group|order|sum|count|avg|having|distinct|subquery|GL|journals?|invoices?|bills?)\b/i.test(correctionText);
@@ -873,7 +934,7 @@ Deno.serve(async (req: Request) => {
           }
         } catch { /* best-effort */ }
         if (verifiedSql) await saveVerifiedGolden(supabaseUrl, supabaseKey, recent.question, verifiedSql, `Correction: ${correctionText}`);
-        await deleteSlackProgress(slack_bot_token, slack_channel);
+        await deleteProgress();
         const fullAnswer = correctedAnswer
           ? `📝 *Correction for:* _"${recent.question}"_\nNote: _${correctionText}_\n\n---\n*Updated:*\n${correctedAnswer}\n\n_✅ Verified SQL saved._`
           : `📝 *Recorded SQL correction:* _${correctionText}_\n⚠️ Could not auto-generate corrected SQL. I'll remember this rule for next time.`;
@@ -894,7 +955,7 @@ Deno.serve(async (req: Request) => {
           correctedAnswer = fmt.text;
         } catch { /* best-effort */ }
       }
-      await deleteSlackProgress(slack_bot_token, slack_channel);
+      await deleteProgress();
       const fullAnswer = correctedAnswer
         ? `📝 *Correction for:* _"${recent.question}"_\nRule: _${correctionText}_\n\n---\n*Updated:*\n${correctedAnswer}\n\n_✅ Rule saved — I'll apply this to future answers._`
         : `📝 *Rule saved:* _${correctionText}_\n✅ I'll apply this to all future answers.`;
@@ -917,21 +978,22 @@ Deno.serve(async (req: Request) => {
         callPerplexity(metricKW.length > 0 ? `Industry benchmark ${metricKW.join(', ')} for manufacturing` : question, perplexityKey).catch(() => null),
       ]);
       let answer = ''; if (sqlData) answer += `*📊 Your Data*\n${sqlData}\n\n`; if (researchData) answer += `*🔬 Industry*\n${researchData.text}`;
-      await deleteSlackProgress(slack_bot_token, slack_channel);
+      await deleteProgress();
       return Response.json({ answer: answer || 'Could not retrieve data or benchmarks.', mode: 'hybrid', duration_ms: ms() });
     }
-    try { const r = await callPerplexity(question, perplexityKey); await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: `*🔬 Research*\n\n${r.text}`, mode: 'research', duration_ms: ms() }); }
+    try { const r = await callPerplexity(question, perplexityKey); await deleteProgress(); return Response.json({ answer: `*🔬 Research*\n\n${r.text}`, mode: 'research', duration_ms: ms() }); }
     catch { /* fall through */ }
   }
 
   // ── SQL QUERY MODE — CONFIDENCE-BASED PIPELINE
   await progress('⏳ Understanding your question...');
 
-  const [examples, allDefinitions, priorContext, userFeedback] = await Promise.all([
+  const [examples, allDefinitions, priorContext, userFeedback, schemaHints] = await Promise.all([
     fetchGoldenExamples(supabaseUrl, supabaseKey),
     fetchFinancialDefinitions(supabaseUrl, supabaseKey),
     fetchConversationContext(supabaseUrl, supabaseKey, user_id, channel),
     fetchRecentFeedback(supabaseUrl, supabaseKey),
+    fetchSchemaHints(supabaseUrl, supabaseKey, 'finance'),
   ]);
 
   // ── GOLDEN MATCH CHECK (100% confidence — skip everything)
@@ -948,7 +1010,7 @@ Deno.serve(async (req: Request) => {
       const transparency = buildTransparency(mode, { defsUsed: goldenDefs, audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: true, sql });
       answer += transparency.text;
       answer += FEEDBACK_FOOTER;
-      await deleteSlackProgress(slack_bot_token, slack_channel);
+      await deleteProgress();
       const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: sql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
       return Response.json({ answer, log_id: logId, sql, rows: result.rows.length, model_used: 'golden_match', golden_match: true, duration_ms: ms(), transparency_meta: transparency.meta });
     } catch { /* golden SQL failed — fall through to normal pipeline */ }
@@ -970,7 +1032,7 @@ Deno.serve(async (req: Request) => {
       const transparency = buildTransparency(mode, { defsUsed: [matchedDef], audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: false, sql: templateSql });
       answer += transparency.text;
       answer += FEEDBACK_FOOTER;
-      await deleteSlackProgress(slack_bot_token, slack_channel);
+      await deleteProgress();
       const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
       return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'intent_confirmed', mode, duration_ms: ms(), transparency_meta: transparency.meta });
     } catch { /* template SQL failed — fall through */ }
@@ -1010,7 +1072,7 @@ ${intentCatalog}`;
               { type: 'button', text: { type: 'plain_text', text: `❌ None — let AI figure it out`, emoji: true }, action_id: 'intent_skip', value: JSON.stringify({ question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) },
             ] },
           ];
-          await deleteSlackProgress(slack_bot_token, slack_channel);
+          await deleteProgress();
           await fetch('https://slack.com/api/chat.postMessage', { method: 'POST', headers: { 'Authorization': `Bearer ${slack_bot_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ channel: slack_channel, thread_ts: slack_thread_ts, blocks: confirmBlocks, text: `Confirm: ${matchedDef.term}?` }) });
           return Response.json({ answer: `Waiting for intent confirmation: ${matchedDef.term}`, intent_pending: true, duration_ms: ms() });
         }
@@ -1026,7 +1088,7 @@ ${intentCatalog}`;
           const transparency = buildTransparency(mode, { defsUsed: [matchedDef], audited: true, auditIssues: 'none', auditConfidence: 1.0, termsResearched: [], goldenMatch: false, sql: templateSql });
           answer += transparency.text;
           answer += FEEDBACK_FOOTER;
-          await deleteSlackProgress(slack_bot_token, slack_channel);
+          await deleteProgress();
           const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
           return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'intent_classifier', mode, duration_ms: ms(), transparency_meta: transparency.meta });
         } catch { /* template SQL failed — fall through */ }
@@ -1051,7 +1113,7 @@ ${intentCatalog}`;
     if (research) {
       if (research.confidence < threshold && !resolution) {
         const clarification = buildTermClarification(term, research);
-        await deleteSlackProgress(slack_bot_token, slack_channel);
+        await deleteProgress();
         return Response.json({
           type: 'clarification', clarification_type: 'unknown_term',
           message: clarification.message, options: clarification.options,
@@ -1098,7 +1160,7 @@ ${intentCatalog}`;
       ambiguityConfidence = ambiguityCheck.confidence;
 
       if (ambiguityCheck.confidence < threshold) {
-        await deleteSlackProgress(slack_bot_token, slack_channel);
+        await deleteProgress();
         return Response.json({
           type: 'clarification', clarification_type: 'ambiguous_query',
           message: ambiguityCheck.message, options: ambiguityCheck.interpretations,
@@ -1125,19 +1187,19 @@ ${intentCatalog}`;
   }
 
   const relevantDefs = matchRelevantDefinitions(thread_context ? `${thread_context} ${question}` : question, allDefinitions);
-  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs, userFeedback);
+  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs, userFeedback, schemaHints);
 
   await progress('⚡ Generating SQL...');
   const complex = isComplexQuery(question);
   let sqlResult: LLMResult;
   try { sqlResult = await callLLM(sqlPrompt, enrichedQuestion, anthropicKey, geminiKey, 1024, complex); }
-  catch (e) { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: 'Sorry, could not generate a query.', error: String(e), duration_ms: ms() }); }
+  catch (e) { await deleteProgress(); return Response.json({ answer: 'Sorry, could not generate a query.', error: String(e), duration_ms: ms() }); }
 
   let sql = cleanSQL(sqlResult.text);
   let modelUsed = sqlResult.model;
   const validation = validateSQL(sql);
   if (!validation.valid) {
-    await deleteSlackProgress(slack_bot_token, slack_channel);
+    await deleteProgress();
     const reason = validation.reason ?? '';
     return Response.json({ answer: reason.startsWith('CANNOT_ANSWER:') ? `I don't have that data. ${reason.replace('CANNOT_ANSWER:', '').trim()}` : 'Could not generate a valid query.', duration_ms: ms() });
   }
@@ -1201,7 +1263,7 @@ ${intentCatalog}`;
 
   // Global deadline check — bail before executing if we're already over
   if (isOverDeadline()) {
-    await deleteSlackProgress(slack_bot_token, slack_channel);
+    await deleteProgress();
     return Response.json({ answer: '⏱️ That question took too long. Try breaking it into a simpler query.', duration_ms: ms() });
   }
 
@@ -1209,10 +1271,10 @@ ${intentCatalog}`;
   let rows: unknown[], finalSql = sql, finalModel = modelUsed;
   try { const result = await executeQuery(sql, supabaseUrl, supabaseKey); rows = result.rows; }
   catch (firstError) {
-    if (isOverDeadline()) { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: '⏱️ That question took too long. Try breaking it into a simpler query.', duration_ms: ms() }); }
+    if (isOverDeadline()) { await deleteProgress(); return Response.json({ answer: '⏱️ That question took too long. Try breaking it into a simpler query.', duration_ms: ms() }); }
     await progress('🔄 Retrying...');
     try { const retry = await callLLM(sqlPrompt, `SQL failed:\n${sql}\nERROR: ${firstError}\nFix it. Output ONLY SQL.`, anthropicKey, geminiKey, 1024, true); const retrySql = cleanSQL(retry.text); if (validateSQL(retrySql).valid) { const r = await executeQuery(retrySql, supabaseUrl, supabaseKey); rows = r.rows; finalSql = retrySql; finalModel = retry.model; } else throw firstError; }
-    catch { await deleteSlackProgress(slack_bot_token, slack_channel); return Response.json({ answer: 'Problem running that query.', sql, error: String(firstError), duration_ms: ms() }); }
+    catch { await deleteProgress(); return Response.json({ answer: 'Problem running that query.', sql, error: String(firstError), duration_ms: ms() }); }
   }
 
   await progress('✅ Formatting...');
@@ -1229,7 +1291,7 @@ ${intentCatalog}`;
   answer += transparency.text;
   answer += FEEDBACK_FOOTER;
 
-  await deleteSlackProgress(slack_bot_token, slack_channel);
+  await deleteProgress();
   const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: finalSql, result_rows: rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
   return Response.json({ answer, log_id: logId, sql: finalSql, rows: rows.length, model_used: finalModel, audited, terms_researched: termsResearched.length > 0 ? termsResearched : undefined, mode, duration_ms: ms(), transparency_meta: transparency.meta });
 });

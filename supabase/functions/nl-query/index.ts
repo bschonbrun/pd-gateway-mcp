@@ -59,6 +59,7 @@ interface FinancialDefinition { term: string; category: string; definition: stri
 interface KnowledgeTerm { term: string; standard_ref?: string; asc_code?: string; category: string; definition: string; guidance: string | null; example: string | null; }
 interface ConversationTurn { question: string; sql: string; answer: string; }
 interface ConversationContext { turns: ConversationTurn[]; }
+interface SchemaHint { category: string; hint: string; }
 interface LLMResult { text: string; model: string; }
 
 // ─── SLACK PROGRESS ───
@@ -109,6 +110,7 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 interface CacheEntry<T> { data: T; ts: number; }
 let _goldenCache: CacheEntry<GoldenExample[]> | null = null;
 let _defCache: CacheEntry<FinancialDefinition[]> | null = null;
+let _hintCache: CacheEntry<SchemaHint[]> | null = null;
 function isCacheValid<T>(e: CacheEntry<T> | null): e is CacheEntry<T> {
   return e !== null && Date.now() - e.ts < CACHE_TTL_MS;
 }
@@ -128,6 +130,12 @@ async function fetchFinancialDefinitions(url: string, key: string): Promise<Fina
   if (isCacheValid(_defCache)) return _defCache.data;
   const data = await dbFetch<FinancialDefinition>(url, key, 'financial_definitions?active=eq.true&select=term,category,definition,formula,sql_template&order=category.asc,term.asc');
   _defCache = { data, ts: Date.now() };
+  return data;
+}
+async function fetchSchemaHints(url: string, key: string): Promise<SchemaHint[]> {
+  if (isCacheValid(_hintCache)) return _hintCache.data;
+  const data = await dbFetch<SchemaHint>(url, key, 'schema_hints?domain=eq.revenue&select=category,hint&order=verified.desc,created_at.desc&limit=20');
+  _hintCache = { data, ts: Date.now() };
   return data;
 }
 async function fetchKnowledgeTerms(url: string, key: string, table: 'gaap_terms' | 'ifrs_terms'): Promise<KnowledgeTerm[]> {
@@ -432,8 +440,11 @@ function buildKnowledgeAnswer(question: string, terms: KnowledgeTerm[], standard
   return out;
 }
 
-function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[]): string {
+function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], relevantDefs: FinancialDefinition[], researchedDefs?: { term: string; definition: string; formula: string }[], schemaHints?: SchemaHint[]): string {
   let prompt = basePrompt;
+  if (schemaHints && schemaHints.length > 0) {
+    prompt += `\n\n## LEARNED RULES — FOLLOW THESE EXACTLY\n${schemaHints.map(h => `- ${h.hint}`).join('\n')}`;
+  }
   if (relevantDefs.length > 0) {
     const defsBlock = relevantDefs.map(d => { let e = `TERM: ${d.term} (${d.category})\nDEFINITION: ${d.definition}`; if (d.formula) e += `\nFORMULA: ${d.formula}`; if (d.sql_template) e += `\nSQL PATTERN: ${d.sql_template}`; return e; }).join('\n\n');
     prompt += `\n\n## RELEVANT FINANCIAL DEFINITIONS — MANDATORY\n${defsBlock}`;
@@ -958,6 +969,21 @@ Deno.serve(async (req: Request) => {
       if (!recent) return Response.json({ answer: 'Ask a question first.' });
       await progress('📝 Recording correction...');
       await writeFeedback(supabaseUrl, supabaseKey, { log_id: recent.id, slack_user: user_id, rating: 'negative', correction: correctionText, feedback_type: match[1].toLowerCase() });
+
+      // Fire-and-forget: review agent classifies root cause + saves schema hint
+      // Posts its own Slack message to the thread with the diagnosis
+      if (match[1].toLowerCase() === 'wrong' && recent.generated_sql) {
+        fetch(`${supabaseUrl}/functions/v1/review-agent`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${supabaseKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question: recent.question, sql: recent.generated_sql,
+            correction: correctionText, domain: 'revenue', log_id: recent.id,
+            slack_channel, slack_thread_ts,
+          }),
+        }).catch(() => {});
+      }
+
       await progress('🔧 Generating corrected SQL...');
       const [examples, allDefs] = await Promise.all([fetchGoldenExamples(supabaseUrl, supabaseKey), fetchFinancialDefinitions(supabaseUrl, supabaseKey)]);
       const relevantDefs = matchRelevantDefinitions(recent.question, allDefs);
@@ -987,10 +1013,11 @@ Deno.serve(async (req: Request) => {
   // ── SQL QUERY MODE — CONFIDENCE-BASED PIPELINE
   await progress('⏳ Understanding your question...');
 
-  const [examples, allDefinitions, priorContext] = await Promise.all([
+  const [examples, allDefinitions, priorContext, schemaHints] = await Promise.all([
     fetchGoldenExamples(supabaseUrl, supabaseKey),
     fetchFinancialDefinitions(supabaseUrl, supabaseKey),
     fetchConversationContext(supabaseUrl, supabaseKey, user_id, channel),
+    fetchSchemaHints(supabaseUrl, supabaseKey),
   ]);
 
   // ── GOLDEN MATCH CHECK (100% confidence — skip everything)
@@ -1112,7 +1139,7 @@ Deno.serve(async (req: Request) => {
   }
 
   const relevantDefs = matchRelevantDefinitions(thread_context ? `${thread_context} ${question}` : question, allDefinitions);
-  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs);
+  const sqlPrompt = buildPromptWithContext(SQL_SYSTEM_PROMPT, examples, relevantDefs, researchedDefs, schemaHints);
 
   await progress('⚡ Generating SQL...');
   const complex = isComplexQuery(question);
