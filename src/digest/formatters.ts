@@ -1,18 +1,20 @@
 import type { DigestData } from './data.js';
 
-function fmt(n: number): string {
+// ── Formatting helpers (exported for unit tests) ─────────────────────
+
+export function fmt(n: number): string {
   if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
   if (Math.abs(n) >= 1_000) return `$${Math.round(n / 1_000)}K`;
   return n === 0 ? '—' : `$${n.toLocaleString()}`;
 }
 
-function pctDelta(curr: number, prev: number): string {
+export function pctDelta(curr: number, prev: number): string {
   if (!prev) return '';
   const pct = Math.round(((curr - prev) / prev) * 100);
   return pct >= 0 ? `+${pct}%` : `${pct}%`;
 }
 
-function cagr(latest: number, earliest: number, years: number): string {
+export function cagr(latest: number, earliest: number, years: number): string {
   if (!earliest || !latest || years <= 0) return '—';
   const rate = Math.pow(latest / earliest, 1 / years) - 1;
   const pct = Math.round(rate * 100);
@@ -25,7 +27,7 @@ export function fmtShort(n: number): string {
   return n === 0 ? '—' : `$${n.toLocaleString()}`;
 }
 
-function fmtGap(n: number): string {
+export function fmtGap(n: number): string {
   const prefix = n < 0 ? '-$' : '+$';
   const abs = Math.abs(n);
   if (abs >= 1_000_000) return `${prefix}${(abs / 1_000_000).toFixed(2)}M`;
@@ -47,6 +49,22 @@ function periodTag(q: { is_closed: boolean; is_current: boolean }): string {
   if (q.is_current) return ' ◀';
   return ' (Next)';
 }
+
+/**
+ * Escape a string for safe insertion into HTML.
+ * Applied to all data-sourced strings in formatEmail() to prevent
+ * HTML injection from customer names, product names, etc.
+ */
+export function htmlEscape(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ── Slack formatter ──────────────────────────────────────────────────
 
 export function formatSlack(d: DigestData): string {
   const lines: string[] = [
@@ -131,6 +149,8 @@ export function formatSlack(d: DigestData): string {
   return lines.join('\n');
 }
 
+// ── Email formatter ──────────────────────────────────────────────────
+
 function htmlTable(headers: string[], rows: string[][], opts?: { rightAlign?: number[]; highlightRows?: number[] }): string {
   const th = (h: string, i: number) =>
     `<th style="padding:8px 12px;text-align:${opts?.rightAlign?.includes(i) ? 'right' : 'left'};border:1px solid #dddddd;background:#f2f2f2">${h}</th>`;
@@ -147,6 +167,9 @@ ${rows.map((r, ri) => `<tr>${r.map((v, i) => td(v, i, ri)).join('')}</tr>`).join
 
 export function formatEmail(d: DigestData): string {
   const ra = [1, 2, 3, 4, 5, 6];
+  // h() escapes data-sourced strings; numeric/formatted values (fmt(), fmtGap())
+  // only contain digits, $, +/-, M/K and are safe without escaping.
+  const h = htmlEscape;
 
   const ytdTable = htmlTable(
     ['Metric', 'Value'],
@@ -157,38 +180,38 @@ export function formatEmail(d: DigestData): string {
   const qHighlight = d.quarters.map((q, i) => q.is_current ? i : -1).filter(i => i >= 0);
   const qTable = htmlTable(
     ['Quarter', 'Target', 'Forecast', 'Actual', 'Orders', 'Totes'],
-    d.quarters.map(q => [q.label + periodTag(q), fmt(q.target), fmt(q.forecast), q.actual ? fmt(q.actual) : '—', q.orders ? String(q.orders) : '—', q.totes ? String(q.totes) : '—']),
+    d.quarters.map(q => [h(q.label) + periodTag(q), fmt(q.target), fmt(q.forecast), q.actual ? fmt(q.actual) : '—', q.orders ? String(q.orders) : '—', q.totes ? String(q.totes) : '—']),
     { rightAlign: ra, highlightRows: qHighlight },
   );
 
   const mHighlight = d.months.map((m, i) => m.is_current ? i : -1).filter(i => i >= 0);
   const mTable = htmlTable(
     ['Month', 'Target', 'Forecast', 'Actual', 'Orders', 'Totes'],
-    d.months.map(m => [m.label + periodTag(m), fmt(m.target), fmt(m.forecast), m.actual ? fmt(m.actual) : '—', m.orders ? String(m.orders) : '—', m.totes ? String(m.totes) : '—']),
+    d.months.map(m => [h(m.label) + periodTag(m), fmt(m.target), fmt(m.forecast), m.actual ? fmt(m.actual) : '—', m.orders ? String(m.orders) : '—', m.totes ? String(m.totes) : '—']),
     { rightAlign: ra, highlightRows: mHighlight },
   );
 
   const custTable = d.top_customers?.length ? `<h3 style="margin:16px 0 8px">Top 5 Customers MTD</h3>` + htmlTable(
     ['Customer', 'Revenue', 'Orders', 'Top Product'],
-    d.top_customers.map(c => [c.name, fmt(c.revenue), String(c.orders), c.top_product || '—']),
+    d.top_customers.map(c => [h(c.name), fmt(c.revenue), String(c.orders), h(c.top_product || '—')]),
     { rightAlign: [1, 2] },
   ) : '';
 
   const productTable = d.top_products?.length ? `<h3 style="margin:16px 0 8px">Top 5 Products MTD</h3>` + htmlTable(
     ['Product', 'Type', 'Forecast', 'Actual', 'Gap'],
-    d.top_products.map(p => [p.product, p.product_type, fmt(p.forecast), p.actual ? fmt(p.actual) : '—', `<span style="color:${p.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(p.gap)}</span>`]),
+    d.top_products.map(p => [h(p.product), h(p.product_type), fmt(p.forecast), p.actual ? fmt(p.actual) : '—', `<span style="color:${p.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(p.gap)}</span>`]),
     { rightAlign: [2, 3, 4] },
   ) : '';
 
   const gapTable = d.forecast_gaps?.length ? `<h3 style="margin:16px 0 8px">Top 5 Forecast Gaps MTD</h3>` + htmlTable(
     ['Customer', 'Forecast', 'Actual', 'Gap'],
-    d.forecast_gaps.map(g => [g.name, fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(g.gap)}</span>`]),
+    d.forecast_gaps.map(g => [h(g.name), fmt(g.forecast), g.actual ? fmt(g.actual) : '—', `<span style="color:${g.gap < 0 ? '#cc0000' : '#008800'}">${fmtGap(g.gap)}</span>`]),
     { rightAlign: [1, 2, 3] },
   ) : '';
 
   const ordersTable = d.largest_orders?.length ? `<h3 style="margin:16px 0 8px">Top 5 Largest Orders MTD</h3>` + htmlTable(
     ['Order #', 'Customer', 'Product', 'Revenue', 'Totes', 'Date'],
-    d.largest_orders.map(o => [String(o.order_number), o.customer, o.product || '—', fmt(o.revenue), String(o.totes), o.order_date]),
+    d.largest_orders.map(o => [String(o.order_number), h(o.customer), h(o.product || '—'), fmt(o.revenue), String(o.totes), h(o.order_date)]),
     { rightAlign: [3, 4] },
   ) : '';
 
@@ -200,15 +223,15 @@ export function formatEmail(d: DigestData): string {
     const cagrCell = (latest: number, earliest: number) => `<span style="font-weight:600">${cagr(latest, earliest, 3)}</span>`;
     const m = c.mtd;
     const rows: string[][] = [
-      [`MTD (${m.label || ''})`, fmt(m.y3), yoyCell(m.y2, m.y3), yoyCell(m.y1, m.y2), yoyCell(m.y0, m.y1), cagrCell(m.y0, m.y3)],
+      [`MTD (${h(m.label || '')})`, fmt(m.y3), yoyCell(m.y2, m.y3), yoyCell(m.y1, m.y2), yoyCell(m.y0, m.y1), cagrCell(m.y0, m.y3)],
     ];
     if (c.show_qtd) {
       const q = c.qtd;
-      rows.push([`QTD (${q.label || ''})`, fmt(q.y3), yoyCell(q.y2, q.y3), yoyCell(q.y1, q.y2), yoyCell(q.y0, q.y1), cagrCell(q.y0, q.y3)]);
+      rows.push([`QTD (${h(q.label || '')})`, fmt(q.y3), yoyCell(q.y2, q.y3), yoyCell(q.y1, q.y2), yoyCell(q.y0, q.y1), cagrCell(q.y0, q.y3)]);
     }
     const y = c.ytd;
     rows.push(['YTD', fmt(y.y3), yoyCell(y.y2, y.y3), yoyCell(y.y1, y.y2), yoyCell(y.y0, y.y1), cagrCell(y.y0, y.y3)]);
-    yoyTable = `<h3 style="margin:16px 0 8px">Year-over-Year (${c.as_of})</h3>` + htmlTable(
+    yoyTable = `<h3 style="margin:16px 0 8px">Year-over-Year (${h(c.as_of)})</h3>` + htmlTable(
       ['Period', String(yrs[3]), `${yrs[2]} Δ`, `${yrs[1]} Δ`, `${yrs[0]} Δ`, 'CAGR'],
       rows,
       { rightAlign: [1, 2, 3, 4, 5] },
@@ -219,7 +242,7 @@ export function formatEmail(d: DigestData): string {
 <body>
 <div style="font-family:Arial,Helvetica,sans-serif;max-width:700px;color:#1a1a1a">
 <h2 style="margin-bottom:4px">📊 Acme Corp Daily Digest</h2>
-<p style="color:#666666;margin-top:0">${d.report_date}</p>
+<p style="color:#666666;margin-top:0">${h(d.report_date)}</p>
 <h3 style="margin:16px 0 8px">YTD Summary</h3>${ytdTable}
 <h3 style="margin:16px 0 8px">Quarterly Performance</h3>${qTable}
 <h3 style="margin:16px 0 8px">Monthly Performance</h3>${mTable}
@@ -228,6 +251,8 @@ ${yoyTable}${custTable}${productTable}${gapTable}${ordersTable}
 </body>
 </html>`;
 }
+
+// ── WhatsApp formatter ───────────────────────────────────────────────
 
 export function formatWhatsApp(d: DigestData): string {
   const shortDt = fmtDateShort(d.report_date).slice(0, 5);

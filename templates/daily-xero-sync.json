@@ -1,0 +1,61 @@
+{
+  "id": "daily-xero-sync",
+  "version": "1.0.0",
+  "name": "Daily Xero Data Sync",
+  "description": "Fetches all financial data from Xero (bills, AR invoices, journals, bank transactions, credit notes, accounts, contacts, purchase orders, tracking categories) and syncs to Supabase via the sync-xero edge function.",
+
+  "parameters": [
+    {
+      "name": "schedule",
+      "type": "cron",
+      "default": "0 15 * * *",
+      "label": "When to sync",
+      "description": "Default: daily at 8:00am PT (15:00 UTC)"
+    },
+    {
+      "name": "tenants",
+      "type": "list",
+      "label": "Xero Tenants",
+      "default": [
+        { "id": "347ad6ee-9997-4da7-9122-fc58160da64d", "name": "Carbonet Water Treatment - USD" },
+        { "id": "7869f7a8-244c-435c-a58e-1e80f4a2421a", "name": "Carbonet Canada (USD)" }
+      ]
+    },
+    {
+      "name": "endpoints",
+      "type": "list",
+      "label": "Xero API endpoints to sync",
+      "default": [
+        { "path": "Invoices?where=Type%3D%22ACCPAY%22", "key": "bills", "responseKey": "Invoices", "paginated": true },
+        { "path": "Invoices?where=Type%3D%22ACCREC%22", "key": "ar_invoices", "responseKey": "Invoices", "paginated": true },
+        { "path": "Contacts", "key": "contacts", "responseKey": "Contacts", "paginated": true },
+        { "path": "Accounts", "key": "accounts", "responseKey": "Accounts", "paginated": false },
+        { "path": "BankTransactions", "key": "bank_transactions", "responseKey": "BankTransactions", "paginated": true },
+        { "path": "CreditNotes", "key": "credit_notes", "responseKey": "CreditNotes", "paginated": true },
+        { "path": "Journals", "key": "journals", "responseKey": "Journals", "paginated": true },
+        { "path": "PurchaseOrders", "key": "purchase_orders", "responseKey": "PurchaseOrders", "paginated": true },
+        { "path": "TrackingCategories", "key": "tracking_categories", "responseKey": "TrackingCategories", "paginated": false }
+      ]
+    },
+    {
+      "name": "sync_edge_function",
+      "type": "string",
+      "label": "Sync Edge Function URL",
+      "default": "https://iykqsdiochxtfrtmuzdr.supabase.co/functions/v1/sync-xero"
+    }
+  ],
+
+  "data_source": {
+    "type": "xero_api",
+    "auth": "pipedream_connect",
+    "description": "Fetches from multiple Xero API endpoints per tenant, then POSTs each payload to the sync-xero edge function for mapping and upsert."
+  },
+
+  "channels": {},
+
+  "runtime": {
+    "engine": "supabase_edge_function",
+    "entrypoint": "src/engine/xero-sync-executor.ts",
+    "notes": "The executor fetches from Xero API using a provided access token, then POSTs raw data to the sync-xero edge function. Triggered by cron via deploy_template_workflow or on-demand via run_template."
+  }
+}
