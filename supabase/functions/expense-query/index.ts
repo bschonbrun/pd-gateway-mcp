@@ -36,6 +36,8 @@ const DEFINITIONS_PATTERNS = /^\s*(?:\/)?definitions?:?\s*$/i;
 const INTERPRETATION_PATTERNS = /^\s*(?:\/)?interpretation:?\s*$/i;
 const AUDIT_PATTERNS = /^\s*(?:\/)?audit:?\s*$/i;
 const RESOLVE_PATTERNS = /^\s*(?:\/)?resolve:?\s*$/i;
+const CLARIFY_PATTERNS = /^\s*(?:\/)?clarify[:\s]+\s*([\s\S]+)/i;
+const REFERENTIAL_PRONOUNS = /\b(those|that|these|the same|from (above|before|earlier|the last|that)|of (them|it|the above))\b/i;
 const TRAIN_PATTERN = /^\s*train\s*$/i;
 const TRAIN_PREFIX = /^\s*train[:\s]+\s*/i;
 const NORMAL_PATTERN = /^\s*normal\s*$/i;
@@ -392,7 +394,7 @@ function buildPromptWithContext(basePrompt: string, examples: GoldenExample[], r
 
 // ─── HELP TEXT ───
 
-const DATA_SUMMARY = `*Financial Intelligence — Available Data* 📊\n\n*💳 Float Financial* — ~5,970 corporate card records\n*📋 Expensify* — ~25,800 expense records\n*📄 Xero AP* — 26,000+ bills (2 entities)\n*🧾 Xero AR* — invoices (2 entities)\n*🏦 Banking, GL Journals, Chart of Accounts*\n\n*Commands:* \`train\` • \`normal\` • \`debug:\` • \`explain:\` • \`wrong: [correction]\` • \`teach: [rule]\``;
+const DATA_SUMMARY = `*Financial Intelligence — Available Data* 📊\n\n*💳 Float Financial* — ~5,970 corporate card records\n*📋 Expensify* — ~25,800 expense records\n*📄 Xero AP* — 26,000+ bills (2 entities)\n*🧾 Xero AR* — invoices (2 entities)\n*🏦 Banking, GL Journals, Chart of Accounts*\n\n*Commands:* \`train\` • \`normal\` • \`debug:\` • \`explain:\` • \`clarify: [question]\` • \`wrong: [correction]\` • \`teach: [rule]\``;
 
 // ─── SCHEMA ───
 
@@ -467,6 +469,13 @@ XERO ENTITIES:
   ship_mode text, reference_number text, order_invoice text
   FILTERS: WHERE NOT is_draft AND NOT is_cancelled
 
+## TABLE RELATIONSHIPS (JOIN KEYS)
+- sales_orders.order_invoice = xero_ar_invoices.invoice_number (links revenue orders to AR invoices)
+- xero_ar_invoices.id = xero_ar_line_items.invoice_id
+- xero_bills.id = xero_bill_line_items.bill_id
+- xero_invoice_payments.invoice_id = xero_ar_invoices.id (for AR) or xero_bills.id (for AP)
+- xero_contacts.name matches xero_ar_invoices.contact_name or xero_bills.contact_name
+
 ## FORMULA PRIORITY
 1. FIRST check RELEVANT FINANCIAL DEFINITIONS
 2. THEN apply company-specific rules
@@ -483,7 +492,7 @@ XERO ENTITIES:
 - Current date: ${new Date().toISOString().split('T')[0]}
 `;
 
-const SQL_SYSTEM_PROMPT = `You are a SQL expert for Acme Corp financial database (PostgreSQL).\nGenerate a single SELECT query.\n\n${EXPENSE_SCHEMA_CONTEXT}\n\nRules: Output ONLY SQL. CANNOT_ANSWER: <reason> if impossible. Default LIMIT 20. Follow-ups: use PRIOR context.`;
+const SQL_SYSTEM_PROMPT = `You are a SQL expert for Acme Corp financial database (PostgreSQL).\nGenerate a single SELECT query.\n\n${EXPENSE_SCHEMA_CONTEXT}\n\nRules: Output ONLY SQL. CANNOT_ANSWER: <reason> if impossible. Default LIMIT 20.\n\nTHREAD CONTEXT RULE: When prior context references a specific data scope (e.g. MTD revenue from sales_orders), ALL follow-up questions MUST preserve that scope. If the user says "those invoices", "that revenue", or "how much is paid" — JOIN back to the original table/filter to maintain scope. Example: If prior query showed MTD revenue from sales_orders, and user asks "which are paid", JOIN sales_orders to xero_ar_invoices via order_invoice=invoice_number and filter to the same date range. NEVER switch to a completely different unscoped query on a different table.`;
 const FORMAT_SYSTEM_PROMPT = `Format SQL results into a Slack message answering the user's question.
 
 Rules:
@@ -521,7 +530,7 @@ METHODOLOGY TRANSPARENCY — for any calculated ratio or KPI (DSO, DPO, margins,
   - Whether the result looks healthy or concerning
 - Keep methodology notes brief — one italic line after the answer, not a lecture`;
 const FORBIDDEN_PATTERNS = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE|CALL)\b/i;
-const FEEDBACK_FOOTER = `\n\n---\n_💡 \`wrong: [correction]\` • \`teach: [rule]\` • \`debug:\` • \`explain:\`_`;
+const FEEDBACK_FOOTER = `\n\n---\n_💡 \`wrong: [correction]\` • \`teach: [rule]\` • \`debug:\` • \`explain:\` • \`clarify: [question]\`_`;
 
 // ─── LLM CHAIN ───
 
@@ -773,6 +782,30 @@ Deno.serve(async (req: Request) => {
     return Response.json({ answer: `🧠 *Reasoning: "${recent.question}"*\n\n${result.text}` });
   }
 
+  // ── Clarify: user asks a specific yes/no question about what the SQL did ──
+  const clarifyMatch = question.match(CLARIFY_PATTERNS);
+  if (clarifyMatch) {
+    const concern = clarifyMatch[1].trim();
+    const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
+    if (!recent) return Response.json({ answer: 'No recent query to clarify.' });
+    const allDefs = await fetchFinancialDefinitions(supabaseUrl, supabaseKey);
+    const matched = matchRelevantDefinitions(recent.question, allDefs);
+    const clarifyPrompt = `You are a SQL auditor helping a non-technical user understand what a query did.
+The user has a specific concern or question about the query's scope and behavior.
+Answer their concern DIRECTLY with a clear Yes/No, then explain briefly using plain English.
+Reference the actual SQL WHERE clauses, date filters, and table names to back up your answer.
+Use Slack mrkdwn formatting. Be honest — if the SQL doesn't match what the user expected, say so clearly and suggest how to rephrase.`;
+    const clarifyQuestion = `Original question: "${recent.question}"
+SQL executed:
+${recent.generated_sql}
+
+Definitions used: ${matched.map(d => `${d.term}: ${d.definition}`).join('; ') || 'none'}
+
+User's concern: "${concern}"`;
+    const result = await callLLM(clarifyPrompt, clarifyQuestion, anthropicKey, geminiKey, 512);
+    return Response.json({ answer: `🔎 *Clarification for:* _"${recent.question}"_\n\n*Your question:* _${concern}_\n\n${result.text}\n\n_If this wasn't right, try rephrasing: e.g. "what's the collection rate on April invoices only"_` });
+  }
+
   // ── Drill-down commands ──
   if (DEFINITIONS_PATTERNS.test(question)) {
     const recent = await findMostRecentLog(supabaseUrl, supabaseKey, user_id);
@@ -812,7 +845,7 @@ Deno.serve(async (req: Request) => {
       : 'The SQL diverges significantly from expected patterns — manual review recommended.';
     const hasIssues = a.issues !== 'none' && confPct < 70;
     const resolveHint = hasIssues ? '\n\n_Click *🔧 Resolve* or type `resolve:` to have me fix this automatically._' : '';
-    return Response.json({ answer: `🔬 *Audit for:* _"${recent.question}"_\n\n• *Confidence:* ${confPct}% (${confLabel})\n  _${confExplain}_\n• *Auto-correction:* ${a.autoApplied ? 'Yes — SQL was modified based on audit findings' : 'No'}\n• *Issues found:* ${a.issues === 'none' ? 'None' : a.full_text}${resolveHint}\n\n_Type \`debug:\` to see the actual SQL, or \`wrong: [correction]\` to provide feedback._` });
+    return Response.json({ answer: `🔬 *Audit for:* _"${recent.question}"_\n\n• *Confidence:* ${confPct}% (${confLabel})\n  _${confExplain}_\n• *Auto-correction:* ${a.autoApplied ? 'Yes — SQL was modified based on audit findings' : 'No'}\n• *Issues found:* ${a.issues === 'none' ? 'None' : a.full_text}${resolveHint}\n\n_Type \`debug:\` to see the actual SQL, \`clarify: [question]\` to verify scope, or \`wrong: [correction]\` to provide feedback._` });
   }
 
   if (RESOLVE_PATTERNS.test(question)) {
@@ -1017,11 +1050,24 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── INTENT CLASSIFIER — semantic template matching via fast LLM ──
-  const templateDefs = allDefinitions.filter(d => d.sql_template);
+  let isTemplateMatch = false;
+  const allTemplateDefs = allDefinitions.filter(d => d.sql_template);
+
+  // Keyword pre-filter: narrow candidates using definition keywords before LLM
+  function scoreByKeywords(q: string, def: FinancialDefinition): number {
+    if (!def.keywords?.length) return 0;
+    const lq = q.toLowerCase();
+    return def.keywords.filter(kw => lq.includes(kw.toLowerCase())).length;
+  }
+  const scored = allTemplateDefs.map(d => ({ d, score: scoreByKeywords(question, d) }));
+  const keywordMatches = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+  const templateDefs = keywordMatches.length >= 3
+    ? keywordMatches.map(s => s.d)
+    : allTemplateDefs;
 
   // Direct execution: user confirmed a specific definition via button
-  if (typeof confirmed_def_idx === 'number' && confirmed_def_idx >= 0 && confirmed_def_idx < templateDefs.length) {
-    const matchedDef = templateDefs[confirmed_def_idx];
+  if (typeof confirmed_def_idx === 'number' && confirmed_def_idx >= 0 && confirmed_def_idx < allTemplateDefs.length) {
+    const matchedDef = allTemplateDefs[confirmed_def_idx];
     await progress(`✅ Running confirmed: ${matchedDef.term}`);
     const templateSql = matchedDef.sql_template!;
     try {
@@ -1034,11 +1080,19 @@ Deno.serve(async (req: Request) => {
       answer += FEEDBACK_FOOTER;
       await deleteProgress();
       const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
+      isTemplateMatch = true;
       return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'intent_confirmed', mode, duration_ms: ms(), transparency_meta: transparency.meta });
     } catch { /* template SQL failed — fall through */ }
   }
 
-  if (templateDefs.length > 0 && !resolution && !skip_intent) {
+  // Skip intent classifier when follow-up uses referential pronouns with thread context
+  // e.g. "how many of those invoices are paid" should scope to MTD, not match generic "Collection Rate"
+  const hasReferentialContext = thread_context && REFERENTIAL_PRONOUNS.test(question);
+  if (hasReferentialContext) {
+    console.log(`[intent] Skipping template match — referential pronoun detected with thread context: "${question}"`);
+  }
+
+  if (templateDefs.length > 0 && !resolution && !skip_intent && !hasReferentialContext) {
     const intentCatalog = templateDefs.map((d, i) => `${i}: ${d.term} — ${d.definition}`).join('\n');
     const intentPrompt = `You match user questions to financial metric definitions.
 Given the user's question and available metrics, return the INDEX NUMBER of the BEST matching metric.
@@ -1067,8 +1121,8 @@ ${intentCatalog}`;
           const confirmBlocks = [
             { type: 'section', text: { type: 'mrkdwn', text: `🎓 *I think you're asking about:*\n\n> *${matchedDef.term}* — ${matchedDef.definition}` } },
             { type: 'actions', elements: [
-              { type: 'button', text: { type: 'plain_text', text: `✅ Yes, run this`, emoji: true }, style: 'primary' as const, action_id: 'intent_confirm', value: JSON.stringify({ defIdx: matchIdx, question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) },
-              ...altDefs.map((alt, i) => ({ type: 'button' as const, text: { type: 'plain_text' as const, text: `${alt.term}`, emoji: true }, action_id: `intent_alt_${i}`, value: JSON.stringify({ defIdx: templateDefs.indexOf(alt), question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) })),
+              { type: 'button', text: { type: 'plain_text', text: `✅ Yes, run this`, emoji: true }, style: 'primary' as const, action_id: 'intent_confirm', value: JSON.stringify({ defIdx: allTemplateDefs.indexOf(matchedDef), question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) },
+              ...altDefs.map((alt, i) => ({ type: 'button' as const, text: { type: 'plain_text' as const, text: `${alt.term}`, emoji: true }, action_id: `intent_alt_${i}`, value: JSON.stringify({ defIdx: allTemplateDefs.indexOf(alt), question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) })),
               { type: 'button', text: { type: 'plain_text', text: `❌ None — let AI figure it out`, emoji: true }, action_id: 'intent_skip', value: JSON.stringify({ question, channelId: slack_channel, threadTs: slack_thread_ts, engine: 'expense-query', mode }) },
             ] },
           ];
@@ -1090,6 +1144,7 @@ ${intentCatalog}`;
           answer += FEEDBACK_FOOTER;
           await deleteProgress();
           const logId = await logQuery(supabaseUrl, supabaseKey, { user_id, channel, question, generated_sql: templateSql, result_rows: result.rows.length, answer, duration_ms: ms(), slack_ts, slack_channel, transparency_meta: transparency.meta });
+          isTemplateMatch = true;
           return Response.json({ answer, log_id: logId, sql: templateSql, rows: result.rows.length, model_used: 'intent_classifier', mode, duration_ms: ms(), transparency_meta: transparency.meta });
         } catch { /* template SQL failed — fall through */ }
       }
@@ -1209,7 +1264,7 @@ ${intentCatalog}`;
   let auditIssues = 'none';
   let auditAutoApplied = false;
   let auditConfidence = 1.0;
-  if (perplexityKey && relevantDefs.length > 0 && !isOverDeadline()) {
+  if (perplexityKey && relevantDefs.length > 0 && !isOverDeadline() && !isTemplateMatch) {
     await progress('🔎 Auditing query...');
     const audit = await auditSQLViaPerplexity(question, sql, relevantDefs, perplexityKey);
     audited = true;

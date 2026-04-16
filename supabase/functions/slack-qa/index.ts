@@ -364,61 +364,7 @@ async function callEngine(
   }
 }
 
-// ─── THREAD FOLLOW-UP ──────────────────────────────────────────────────────────
-async function handleThreadFollowUp(
-  followUp: string, userId: string, channelId: string, threadTs: string,
-): Promise<void> {
-  try {
-    // Fetch thread history to find the original question and last bot answer
-    const historyRes = await slackPost('conversations.replies', { channel: channelId, ts: threadTs, limit: 20 });
-    const messages = (historyRes.messages ?? []) as Array<Record<string, unknown>>;
 
-    // Find the original question (first message, usually "Q: ...")
-    const parentMsg = messages[0];
-    const originalQ = ((parentMsg?.text as string) ?? '').replace(/^Q:\s*/i, '').replace(/\s*\(.*\)\s*$/, '').trim();
-
-    // Find the last bot answer (longest bot message, likely the data response)
-    const botMessages = messages.filter(m => m.bot_id && !m.subtype && (m.text as string)?.length > 50);
-    const lastBotAnswer = botMessages.length > 0
-      ? (botMessages[botMessages.length - 1].text as string).slice(0, 2000)
-      : '';
-
-    // Post "thinking" message
-    await slackPost('chat.postMessage', {
-      channel: channelId, thread_ts: threadTs,
-      text: '🔄 Processing your follow-up…',
-    });
-
-    // Call engine with thread context
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/expense-query`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question: followUp,
-        user_id: userId,
-        channel: channelId,
-        mode: 'normal',
-        slack_bot_token: SLACK_BOT_TOKEN,
-        slack_channel: channelId,
-        slack_thread_ts: threadTs,
-        thread_context: `Q: ${originalQ}\nAnswer: ${lastBotAnswer}`,
-      }),
-    });
-
-    const data = await res.json();
-    const answerText = (data.answer as string) ?? 'No response from engine.';
-
-    await slackPost('chat.postMessage', {
-      channel: channelId, thread_ts: threadTs,
-      text: answerText.slice(0, 3000),
-    });
-  } catch (err) {
-    await slackPost('chat.postMessage', {
-      channel: channelId, thread_ts: threadTs,
-      text: `❌ Follow-up error: ${err instanceof Error ? err.message : 'Unknown error'}`,
-    });
-  }
-}
 
 // ─── PROCESS + THREAD ──────────────────────────────────────────────────────────
 async function processAndThread(
