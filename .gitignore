@@ -3,3 +3,8 @@ dist/
 .env
 *.js.map
 .mcp.json
+.DS_Store
+.claude/scratch/
+.claude/worktrees/
+.claude/cost-projections/
+.claude/settings.local.json
