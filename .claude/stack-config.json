@@ -4,7 +4,7 @@
   "stack_tier": 2,
   "purpose": "Pipedream gateway MCP server — collapses Pipedream's 10,000+ tools into 23 curated MCP tools; also runs the CarboNet daily revenue digest.",
   "created": "2026-05-16",
-  "last_modified": "2026-05-17",
+  "last_modified": "2026-06-20",
   "orchestration_mode": "main-thread",
   "strict_mode": true,
   "domain_mode": null,
@@ -53,6 +53,29 @@
       "scope": "project",
       "also_updated_global": false,
       "invoked_via": "/project-init"
+    },
+    {
+      "date": "2026-06-20T23:01:17Z",
+      "setting": "loop_policy",
+      "old_value": null,
+      "new_value": "default block (backfill)",
+      "reason": "backfill: loop governor made core scaffolding (Tier 2+)",
+      "scope": "project",
+      "also_updated_global": false,
+      "invoked_via": "script:backfill-loop-policy.sh"
     }
-  ]
+  ],
+  "loop_policy": {
+    "enabled": true,
+    "default_autonomy": "checkpoint",
+    "autonomy_ceiling": "checkpoint",
+    "max_iterations": 25,
+    "max_recursion_depth": 5,
+    "per_run_budget_usd": 5,
+    "timeout_minutes": 180,
+    "no_progress_exit": true,
+    "require_external_termination": "auto",
+    "commit_per_iteration": false,
+    "irreversible_actions_break_loop": true
+  }
 }
